@@ -8,6 +8,8 @@ Moves [Gluetun](https://github.com/qdm12/gluetun) to another VPN exit when a str
 
 Copy this repository's files into `/data/plugins/gluetun_autoswitch` in your Dispatcharr data folder, then enable **Gluetun AutoSwitch** on the Plugins page.
 
+Or download `gluetun_autoswitch-1.5.0.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
+
 ## Use
 
 1. Dispatcharr must run through Gluetun, with Gluetun's control server reachable from Dispatcharr.
