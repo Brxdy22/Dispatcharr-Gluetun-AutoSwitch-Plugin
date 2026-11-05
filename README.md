@@ -11,7 +11,7 @@ Copy this repository's files into `/data/plugins/gluetun_autoswitch` in your Dis
 ## Use
 
 1. Dispatcharr must run through Gluetun, with Gluetun's control server reachable from Dispatcharr.
-2. Set the Gluetun URL and your list of exits in the plugin settings.
+2. Set the Gluetun URL and your allowed countries and cities in the plugin settings.
 3. Use **Check status** to confirm it can reach Gluetun, then turn on Auto switch.
 
 ## Notes
