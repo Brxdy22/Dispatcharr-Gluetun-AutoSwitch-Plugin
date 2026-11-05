@@ -2,7 +2,7 @@
   "name": "Gluetun AutoSwitch",
   "version": "1.5.0",
   "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums.",
-  "author": "brxdy",
+  "author": "Brxdy22",
   "license": "MIT",
   "repo_url": "https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin",
   "fields": [
