@@ -6,6 +6,8 @@ A plugin for [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr).
 
 Moves [Gluetun](https://github.com/qdm12/gluetun) to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums.
 
+Tested on Dispatcharr 0.33.0.
+
 ## Install
 
 Copy this repository's files into `/data/plugins/gluetun_autoswitch` in your Dispatcharr data folder, then enable **Gluetun AutoSwitch** on the Plugins page.
