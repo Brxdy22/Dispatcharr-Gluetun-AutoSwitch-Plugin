@@ -1,0 +1,220 @@
+{
+  "name": "Gluetun AutoSwitch",
+  "version": "1.5.0",
+  "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums.",
+  "author": "brxdy",
+  "license": "MIT",
+  "repo_url": "https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin",
+  "fields": [
+    {
+      "id": "auto_switch",
+      "label": "Auto switch",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Off = observe only: problems are logged as 'would switch'. On = really moves the VPN exit. A switch interrupts every stream on the tunnel for about 10 to 20 seconds."
+    },
+    {
+      "id": "exit_countries",
+      "label": "Allowed countries",
+      "type": "string",
+      "default": "USA",
+      "help_text": "Gluetun country names, comma-separated, for example USA, Canada. Capitals are optional. Only used when Allowed cities is empty: each switch then asks for a random server, moving to the next country if several are listed."
+    },
+    {
+      "id": "exits",
+      "label": "Allowed cities",
+      "type": "string",
+      "default": "Ashburn VA, Washington DC, New York NY, Secaucus NJ, Boston MA, Raleigh NC, Atlanta GA, Detroit MI, Chicago IL, Miami FL, Kansas City MO, Houston TX, Dallas TX, McAllen TX, Denver CO, Salt Lake City UT, Phoenix AZ, Seattle WA, Los Angeles CA, San Jose CA, San Francisco CA",
+      "help_text": "Gluetun city names, comma-separated, tried in this order. Capitals are optional. These take priority over Allowed countries. Leave empty to use countries alone."
+    },
+    {
+      "id": "blocked_countries",
+      "label": "Blocked countries",
+      "type": "string",
+      "default": "",
+      "help_text": "Optional. Countries never to move to, comma-separated. Capitals are optional."
+    },
+    {
+      "id": "blocked_cities",
+      "label": "Blocked cities",
+      "type": "string",
+      "default": "",
+      "help_text": "Optional. Cities never to move to, comma-separated. Capitals are optional. With countries only, the plugin picks the city itself so a blocked one can't come up."
+    },
+    {
+      "id": "min_speed",
+      "label": "Minimum speed (x real time)",
+      "type": "number",
+      "default": 0.9,
+      "help_text": "A stream counts as slow below this. 1.0 is exactly real time."
+    },
+    {
+      "id": "window_seconds",
+      "label": "Slow for (seconds)",
+      "type": "number",
+      "default": 90,
+      "help_text": "How long a stream must stay slow before anything happens."
+    },
+    {
+      "id": "cooldown_minutes",
+      "label": "Minutes between switches",
+      "type": "number",
+      "default": 5,
+      "help_text": "Minimum wait after a switch."
+    },
+    {
+      "id": "max_switches_per_hour",
+      "label": "Maximum switches per hour",
+      "type": "number",
+      "default": 3,
+      "help_text": "Stops a provider problem, which no exit can fix, from cutting streams over and over."
+    },
+    {
+      "id": "reject_retries",
+      "label": "VOD rejections before switching",
+      "type": "number",
+      "default": 3,
+      "help_text": "How many VOD attempts one account may have refused on the current exit before moving. Needs the VOD Failover plugin, which logs each attempt."
+    },
+    {
+      "id": "reject_window_minutes",
+      "label": "Count rejections within (minutes)",
+      "type": "number",
+      "default": 15,
+      "help_text": "Older rejections are forgotten. The count also restarts on a new exit."
+    },
+    {
+      "id": "reject_codes",
+      "label": "Rejection codes",
+      "type": "string",
+      "default": "403, 520-527",
+      "help_text": "HTTP answers that mean the exit address was refused. Leave out 404 (title missing) and 458, 460 or 429 (connection limit): a new exit fixes none of those."
+    },
+    {
+      "id": "probe_minutes",
+      "label": "Login check every (minutes)",
+      "type": "number",
+      "default": 5,
+      "help_text": "Asks each Xtream account for its login page, which uses no stream connection, to notice a refused exit even when nobody is watching. 0 turns it off."
+    },
+    {
+      "id": "probe_refusals",
+      "label": "Refused login checks before switching",
+      "type": "number",
+      "default": 2,
+      "help_text": "Checks in a row answering 520 to 527. This switch waits until nobody is watching."
+    },
+    {
+      "id": "gluetun_url",
+      "label": "Gluetun URL",
+      "type": "string",
+      "default": "http://127.0.0.1:8000",
+      "help_text": "Gluetun's control server as Dispatcharr sees it."
+    },
+    {
+      "id": "speedtest",
+      "label": "Speed test",
+      "type": "section",
+      "collapsed": false
+    },
+    {
+      "id": "speedtest_last",
+      "label": "Last speed test",
+      "type": "text",
+      "section": "speedtest",
+      "rows": 4,
+      "default": "",
+      "placeholder": "No speed test has run yet.",
+      "help_text": "Filled in by each speed test. Refresh the page to see a new result. Edits here are replaced."
+    },
+    {
+      "section": "speedtest",
+      "id": "speedtest_minutes",
+      "label": "Test every (minutes)",
+      "type": "number",
+      "default": 60,
+      "help_text": "Automatic speed test of the current exit, only when nobody is watching. About 340 MB each. 0 turns it off."
+    },
+    {
+      "section": "speedtest",
+      "id": "speedtest_failures",
+      "label": "Failed tests before switching",
+      "type": "number",
+      "default": 2,
+      "help_text": "Tests in a row below the minimums. A failed test is repeated after 5 minutes. The switch waits until nobody is watching."
+    },
+    {
+      "section": "speedtest",
+      "id": "min_download",
+      "label": "Minimum download (Mbps)",
+      "type": "number",
+      "default": 30,
+      "help_text": "On one connection, like a stream. Your heaviest stream so far used about 10 Mbps. 0 turns this check off."
+    },
+    {
+      "section": "speedtest",
+      "id": "min_upload",
+      "label": "Minimum upload (Mbps)",
+      "type": "number",
+      "default": 0,
+      "help_text": "0 turns this check off, which is recommended: streams only come down through the VPN."
+    },
+    {
+      "section": "speedtest",
+      "id": "max_ping",
+      "label": "Maximum ping (ms)",
+      "type": "number",
+      "default": 150,
+      "help_text": "Ping to Cloudflare through the exit. 0 turns this check off."
+    },
+    {
+      "section": "speedtest",
+      "id": "provider_ping_factor",
+      "label": "Provider ping limit (x usual)",
+      "type": "number",
+      "default": 2,
+      "help_text": "Fails when a provider's ping is this many times its usual, taken from recent healthy tests. Compared per provider, because some are simply far away. 0 turns this check off."
+    }
+  ],
+  "actions": [
+    {
+      "id": "status",
+      "label": "Check status",
+      "description": "Shows the current exit, stream speeds and recent decisions.",
+      "button_label": "Check",
+      "button_variant": "default"
+    },
+    {
+      "id": "change_exit",
+      "label": "Change exit node",
+      "description": "Moves to the next allowed exit right away, even with Auto switch off. Interrupts every stream on the tunnel.",
+      "button_label": "Change exit node",
+      "button_variant": "filled",
+      "button_color": "red",
+      "confirm": {
+        "required": true,
+        "title": "Change exit node?",
+        "message": "This interrupts every stream on the tunnel for about 10 to 20 seconds."
+      }
+    },
+    {
+      "id": "speed_test",
+      "label": "Run speed test",
+      "description": "Measures the current exit's download, upload and ping, plus ping to each provider. Takes about 20 seconds.",
+      "button_label": "Run speed test",
+      "button_variant": "filled",
+      "confirm": {
+        "required": true,
+        "title": "Run speed test?",
+        "message": "This uses the VPN tunnel for about 20 seconds, which may briefly slow streams playing now."
+      }
+    },
+    {
+      "id": "ask_provider",
+      "label": "Ask the provider",
+      "description": "Asks every Xtream account now and shows each answer. Nothing is moved.",
+      "button_label": "Ask",
+      "button_variant": "default"
+    }
+  ]
+}
