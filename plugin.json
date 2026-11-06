@@ -1,7 +1,7 @@
 {
   "name": "Gluetun AutoSwitch",
-  "version": "1.6.1",
-  "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums.",
+  "version": "1.7",
+  "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums. Exits a provider refused are kept off for 30 days.",
   "author": "Brxdy22",
   "license": "MIT",
   "repo_url": "https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin",
@@ -74,6 +74,24 @@
       "placeholder": "None"
     },
     {
+      "id": "blocked_exits",
+      "label": "Blocked exits",
+      "type": "multiselect",
+      "default": [],
+      "help_text": "Servers never to move to. Added automatically when a provider refuses VOD on an exit, and dropped after 30 days. Pick a server to block it yourself. Unselect one and Save to use it again. If an exit was added after you opened this page, refresh first: a Save from an older page can't remove anything.",
+      "options": [],
+      "placeholder": "None"
+    },
+    {
+      "id": "blocked_exits_info",
+      "label": "Blocked exits details",
+      "type": "text",
+      "rows": 3,
+      "default": "",
+      "placeholder": "No exit is blocked.",
+      "help_text": "Filled in automatically: address, server, city, which account blocked it, and when it expires. Refresh the page to see new entries. Edits here are replaced."
+    },
+    {
       "id": "min_speed",
       "label": "Minimum speed (x real time)",
       "type": "number",
@@ -133,6 +151,20 @@
       "help_text": "HTTP answers that mean the exit address was refused. 404 (title missing) and 458, 460 or 429 (connection limit) aren't offered: a new exit fixes none of those.",
       "options": [],
       "placeholder": "Choose codes"
+    },
+    {
+      "id": "vod_block_switch",
+      "label": "Switch at the first blocked VOD",
+      "type": "boolean",
+      "default": true,
+      "help_text": "When every server of an account answers 404 for a title, and a title that played before is refused too, the exit is refused, not the title. m3u-failover then holds the player while the exit moves and tries again, so playback starts a few seconds late instead of failing, and the exit goes on Blocked exits. Ignores Minutes between switches, but not the hourly limit. Needs Auto switch on and m3u-failover 1.2."
+    },
+    {
+      "id": "vod_check_minutes",
+      "label": "Background VOD check every (minutes)",
+      "type": "number",
+      "default": 15,
+      "help_text": "Only while nobody is watching: m3u-failover asks each account for one byte of a title that played before. Nothing is logged while VOD works. If the exit is refused, it goes on Blocked exits and the exit moves before anyone presses play. Needs Auto switch on and m3u-failover 1.2. 0 turns it off."
     },
     {
       "id": "probe_minutes",
@@ -259,6 +291,18 @@
       "description": "Asks every Xtream account now and shows each answer. Nothing is moved.",
       "button_label": "Ask",
       "button_variant": "default"
+    },
+    {
+      "id": "clear_blocked",
+      "label": "Clear blocked exits",
+      "description": "Removes every exit from Blocked exits, so all of them can be used again.",
+      "button_label": "Clear",
+      "button_variant": "default",
+      "confirm": {
+        "required": true,
+        "title": "Clear blocked exits?",
+        "message": "Every blocked exit can be used again straight away."
+      }
     }
   ]
 }

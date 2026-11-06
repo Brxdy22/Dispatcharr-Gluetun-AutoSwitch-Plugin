@@ -884,6 +884,364 @@ class SelectionFields(unittest.TestCase):
                 handle.write("{bad")
             self.assertEqual(P.read_servers(path), {})
 
+ROWS = [
+    {"hostname": "us-aaa-wg-001", "city": "Ashburn VA", "country": "USA"},
+    {"hostname": "us-aaa-wg-002", "city": "Ashburn VA", "country": "USA"},
+    {"hostname": "us-bbb-wg-001", "city": "Boston MA", "country": "USA"},
+    {"hostname": "ca-ttt-wg-001", "city": "Toronto", "country": "Canada"},
+]
+FIRST = lambda pool: pool[0]  # noqa: E731
+
+class PlanServer(unittest.TestCase):
+    def plan(self, here=None, countries=("usa",), cities=(), **kw):
+        found = P.plan_server(ROWS, here or {}, list(countries), list(cities), choose=FIRST, **kw)
+        return found and found["hostname"]
+    def test_never_the_current_server(self):
+        self.assertEqual(self.plan({"hostname": "us-aaa-wg-001", "country": "USA"}), "us-aaa-wg-002")
+    def test_skips_blocked_servers(self):
+        self.assertEqual(self.plan(blocked_hosts={"us-aaa-wg-001", "us-aaa-wg-002"}), "us-bbb-wg-001")
+    def test_same_city_is_fine_on_another_server(self):
+        self.assertEqual(self.plan({"hostname": "us-aaa-wg-001", "city": "Ashburn VA"}, cities=("ashburn va",)), "us-aaa-wg-002")
+    def test_cities_go_in_order_after_the_current_one(self):
+        here = {"hostname": "us-bbb-wg-001", "city": "Boston MA"}
+        self.assertEqual(self.plan(here, cities=("ashburn va", "boston ma")), "us-aaa-wg-001")
+        here = {"hostname": "us-aaa-wg-001", "city": "Ashburn VA"}
+        self.assertEqual(self.plan(here, cities=("ashburn va", "boston ma")), "us-bbb-wg-001")
+    def test_next_country_first(self):
+        self.assertEqual(self.plan({"hostname": "us-aaa-wg-001", "country": "USA"}, countries=("usa", "canada")), "ca-ttt-wg-001")
+    def test_blocked_cities_and_countries(self):
+        self.assertEqual(self.plan(blocked_cities=("ashburn va",)), "us-bbb-wg-001")
+        self.assertIsNone(self.plan(countries=("usa",), blocked_countries=("USA",)))
+    def test_nothing_left(self):
+        self.assertIsNone(self.plan(blocked_hosts={"us-aaa-wg-001", "us-aaa-wg-002", "us-bbb-wg-001"}))
+    def test_unknown_place_starts_at_the_top(self):
+        self.assertEqual(self.plan({}, cities=("boston ma", "ashburn va")), "us-bbb-wg-001")
+    def test_read_server_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "s.json")
+            with open(path, "w") as handle:
+                json.dump({"servers": [
+                    {"vpn": "wireguard", "hostname": "h1", "city": "A", "country": "USA", "wgpubkey": "k"},
+                    {"vpn": "openvpn", "hostname": "h2", "city": "A", "country": "USA"},
+                    {"vpn": "wireguard", "city": "A", "country": "USA"},
+                ]}, handle)
+            self.assertEqual(P.read_server_rows(path), [{"hostname": "h1", "city": "A", "country": "USA"}])
+            self.assertEqual(P.read_server_rows(path + "x"), [])
+
+HERE = {"ip": "198.51.100.7", "hostname": "us-aaa-wg-001", "city": "Ashburn, VA"}
+
+class Blocks(unittest.TestCase):
+    def test_add_and_repeat(self):
+        entries = P.add_block({}, HERE, "Provider A", 1000)
+        self.assertEqual(entries["us-aaa-wg-001"]["accounts"], ["Provider A"])
+        self.assertEqual(entries["us-aaa-wg-001"]["expires"], 1000 + 30 * 86400)
+        again = P.add_block(entries, HERE, "Provider B", 5000)
+        self.assertEqual(again["us-aaa-wg-001"]["accounts"], ["Provider A", "Provider B"])
+        self.assertEqual(again["us-aaa-wg-001"]["expires"], 5000 + 30 * 86400)
+        self.assertEqual(entries["us-aaa-wg-001"]["accounts"], ["Provider A"])  # the input is untouched
+        self.assertEqual(P.add_block(again, HERE, "Provider A", 6000)["us-aaa-wg-001"]["accounts"], ["Provider A", "Provider B"])
+    def test_unknown_server_name_keys_by_address(self):
+        self.assertIn("198.51.100.7", P.add_block({}, {"ip": "198.51.100.7"}, "Provider A", 1))
+    def test_expiry(self):
+        entries = P.add_block({}, HERE, "Provider A", 1000)
+        self.assertTrue(P.active_blocks(entries, 1000 + 29 * 86400))
+        self.assertFalse(P.active_blocks(entries, 1000 + 30 * 86400))
+    def test_render(self):
+        text = P.render_blocks(P.add_block({}, HERE, "Provider A", 1000), 4)
+        self.assertIn("198.51.100.7 - us-aaa-wg-001, Ashburn, VA - blocked by Provider A on", text)
+        self.assertTrue(text.endswith("List version 4."))
+        self.assertEqual(P.render_blocks({}, 0), "List version 0. No exit is blocked.")
+
+class Reconcile(unittest.TestCase):
+    def setUp(self):
+        self.entries = P.add_block({}, HERE, "Provider A", 1000)
+    def test_a_current_page_can_unblock(self):
+        kept, version = P.reconcile(self.entries, 3, [], "List version 3.", ROWS, 2000)
+        self.assertEqual((kept, version), ({}, 4))
+    def test_an_older_page_cannot(self):
+        self.assertEqual(P.reconcile(self.entries, 3, [], "List version 2.", ROWS, 2000), (self.entries, 3))
+        self.assertEqual(P.reconcile(self.entries, 3, [], "", ROWS, 2000), (self.entries, 3))
+        self.assertEqual(P.reconcile(self.entries, 3, [], "edited", ROWS, 2000), (self.entries, 3))
+    def test_nothing_changed_keeps_the_version(self):
+        self.assertEqual(P.reconcile(self.entries, 3, ["us-aaa-wg-001"], "List version 3.", ROWS, 2000), (self.entries, 3))
+    def test_picked_by_hand(self):
+        kept, version = P.reconcile(self.entries, 3, ["us-aaa-wg-001", "us-bbb-wg-001"], "List version 3.", ROWS, 2000)
+        self.assertEqual(version, 4)
+        self.assertEqual(kept["us-bbb-wg-001"]["accounts"], ["you"])
+        self.assertEqual(kept["us-bbb-wg-001"]["city"], "Boston MA")
+        self.assertEqual(kept["us-bbb-wg-001"]["expires"], 2000 + 30 * 86400)
+
+class ExitOptions(unittest.TestCase):
+    def test_every_server_and_blocked_first(self):
+        entries = P.add_block({}, HERE, "Provider A", 1000)
+        options = P.exit_options(ROWS, ["USA"], entries, [])
+        self.assertEqual([o["value"] for o in options], ["us-aaa-wg-001", "us-aaa-wg-002", "us-bbb-wg-001"])
+        self.assertEqual(options[0]["label"], "us-aaa-wg-001 - Ashburn VA - 198.51.100.7 - blocked by Provider A")
+        self.assertEqual(options[1]["label"], "us-aaa-wg-002 - Ashburn VA")
+    def test_blocked_elsewhere_and_saved_values_stay(self):
+        entries = P.add_block({}, {"ip": "203.0.113.9", "hostname": "ca-ttt-wg-001"}, "Provider A", 1)
+        values = [o["value"] for o in P.exit_options(ROWS, ["USA"], entries, ["gone-wg-9"])]
+        self.assertEqual(values[0], "ca-ttt-wg-001")
+        self.assertEqual(values[-1], "gone-wg-9")
+    def test_build_fields_fills_the_list(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json")
+        with open(path, encoding="utf-8") as handle:
+            manifest = json.load(handle)["fields"]
+        fields = P.build_fields(manifest, {"USA": ["Ashburn VA"]}, ["USA"], {}, ROWS, {})
+        options = next(f for f in fields if f["id"] == "blocked_exits")["options"]
+        self.assertEqual(len(options), 3)
+
+class FakeGluetun:
+    selected = ([], [], [])
+    moves = []
+    def __init__(self, url):
+        pass
+    def selection(self):
+        return FakeGluetun.selected
+    def move_to(self, *args):
+        FakeGluetun.moves.append(args)
+
+class SwitchByServer(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = P.Store(self.dir.name)
+        self.saved = P.Gluetun, P.read_server_rows
+        P.Gluetun, P.read_server_rows = FakeGluetun, lambda: ROWS
+        self.choice, P.random.choice = P.random.choice, FIRST
+        FakeGluetun.selected, FakeGluetun.moves = (["USA"], [], []), []
+        self.settings = {**DEFAULTS, "exits": [], "exit_countries": ["USA"]}
+    def tearDown(self):
+        P.Gluetun, P.read_server_rows = self.saved
+        P.random.choice = self.choice
+        self.dir.cleanup()
+    def test_without_blocks_nothing_changes(self):
+        P.switch_exit(self.settings, self.store, cause="x")
+        self.assertEqual(FakeGluetun.moves, [(["usa"], [])])  # the case flip forces a reconnect
+    def test_blocked_exits_name_a_server(self):
+        self.store.set_blocked(P.add_block({}, HERE, "Provider A", P.time.time()), 1)
+        label = P.switch_exit(self.settings, self.store, cause="x", left=HERE)
+        self.assertEqual(FakeGluetun.moves, [([], [], ["us-aaa-wg-002"])])
+        self.assertEqual(label, "Ashburn VA (us-aaa-wg-002)")
+    def test_an_expired_block_is_ignored(self):
+        self.store.set_blocked(P.add_block({}, HERE, "Provider A", 1000), 1)
+        P.switch_exit(self.settings, self.store, cause="x")
+        self.assertEqual(FakeGluetun.moves, [(["usa"], [])])  # the case flip forces a reconnect
+    def test_a_named_server_keeps_naming_one(self):
+        FakeGluetun.selected = ([], [], ["us-aaa-wg-001"])
+        P.switch_exit(self.settings, self.store, cause="x")
+        self.assertEqual(FakeGluetun.moves, [([], [], ["us-aaa-wg-002"])])
+    def test_everything_blocked_stops(self):
+        now = P.time.time()
+        entries = {}
+        for row in ROWS:
+            entries = P.add_block(entries, {"ip": "x", "hostname": row["hostname"]}, "Provider A", now)
+        self.store.set_blocked(entries, 1)
+        self.assertIsNone(P.switch_exit(self.settings, self.store, cause="x"))
+        self.assertEqual(FakeGluetun.moves, [])
+        self.assertIn("every allowed server is blocked", "".join(self.store.recent(1)))
+    def test_unreadable_server_list_stops(self):
+        P.read_server_rows = lambda: []
+        self.store.set_blocked(P.add_block({}, HERE, "Provider A", P.time.time()), 1)
+        self.assertIsNone(P.switch_exit(self.settings, self.store, cause="x"))
+        self.assertEqual(FakeGluetun.moves, [])
+
+class VodBlocked(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.settings = {"auto_switch": True}
+        self.s = P.Service({"data_dir": self.dir.name, "get_settings": lambda: self.settings})
+        self.s.accounts, self.s.accounts_at = [P.Account("Provider A", "http://127.0.0.1:8091", "u", "p", "")], 1e12
+        self.saved = P.exit_info, P.switch_exit, P.publish_blocked, P.drop_live
+        self.exits = iter([HERE, {"ip": "203.0.113.1", "city": "Boston, MA"}])
+        P.exit_info = lambda timeout=10: next(self.exits)
+        self.moves = []
+        P.switch_exit = lambda *a, **k: self.moves.append(k) or "Boston MA (us-bbb-wg-001)"
+        P.publish_blocked = lambda hosts, text: None
+        P.drop_live = lambda accounts: 0
+    def tearDown(self):
+        P.exit_info, P.switch_exit, P.publish_blocked, P.drop_live = self.saved
+        self.dir.cleanup()
+    def ask(self, **extra):
+        return self.s.vod_blocked({"port": 8091, "title": "movie 1.mkv", "budget": 3, **extra})
+    def test_blocks_moves_and_waits_for_the_tunnel(self):
+        answer = self.ask()
+        self.assertEqual(answer, {"moved": True, "ready": True, "exit": "Boston, MA"})
+        entries, version = self.s.store.blocked()
+        self.assertEqual(entries["us-aaa-wg-001"]["accounts"], ["Provider A"])
+        self.assertEqual(version, 1)
+        self.assertEqual(self.moves[0]["left"], HERE)
+        self.assertFalse(self.s.switch_lock.locked())
+    def test_a_second_request_rides_on_the_move(self):
+        self.ask()
+        self.assertEqual(self.ask()["detail"], "the exit moved moments ago")
+        self.assertEqual(len(self.moves), 1)
+    def test_observe_only(self):
+        self.settings = {"auto_switch": False}
+        self.assertFalse(self.ask()["moved"])
+        self.assertEqual(self.s.store.blocked(), ({}, 0))
+        self.assertIn("would_switch", "".join(self.s.store.recent(1)))
+    def test_turned_off(self):
+        self.settings = {"auto_switch": True, "vod_block_switch": False}
+        self.assertFalse(self.ask()["moved"])
+        self.assertEqual(self.moves, [])
+    def test_hourly_limit_holds_but_cooldown_does_not(self):
+        now = P.time.time()
+        self.s.store.add_switch(now - 60)
+        self.assertTrue(self.ask()["moved"])
+        self.dir2 = tempfile.TemporaryDirectory()
+        self.s.store = P.Store(self.dir2.name)
+        self.s.moved_at = 0
+        for k in range(3):
+            self.s.store.add_switch(now - 100 - k)
+        self.assertEqual(self.ask()["detail"], "hourly limit reached: the provider may be the problem, not the exit")
+        self.dir2.cleanup()
+    def test_unknown_exit_does_nothing(self):
+        P.exit_info = lambda timeout=10: {"error": "URLError"}
+        self.assertFalse(self.ask()["moved"])
+        self.assertEqual(self.moves, [])
+    def test_tunnel_not_back_in_time(self):
+        P.exit_info = lambda timeout=10: HERE
+        answer = self.ask(budget=0.5)
+        self.assertEqual((answer["moved"], answer["ready"]), (True, False))
+    def test_account_name_from_the_port(self):
+        self.assertEqual(self.s.account_name({"port": 8091}), "Provider A")
+        self.assertEqual(self.s.account_name({"port": 9999, "account": "other"}), "other")
+
+class VodCheck(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.settings = {"auto_switch": True}
+        self.s = P.Service({"data_dir": self.dir.name, "get_settings": lambda: self.settings})
+        self.s.accounts = [P.Account("Provider A", "http://127.0.0.1:8091", "u", "p", ""),
+                           P.Account("Remote", "http://example.invalid", "u", "p", "")]
+        self.s.accounts_at = 1e12
+        self.s.vod_check_at = 0
+        self.saved = P.ask_vod_check
+        self.asked, self.answers = [], []
+        P.ask_vod_check = lambda url, forget=False: self.asked.append((url, forget)) or self.answers.pop(0)
+        self.blocked = []
+        self.s.vod_blocked = lambda request: self.blocked.append(request) or {"moved": True, "ready": True}
+        self.s.after_reply = lambda answer: None
+    def tearDown(self):
+        P.ask_vod_check = self.saved
+        self.dir.cleanup()
+    def test_healthy_check_is_silent(self):
+        self.answers = [{"checked": True, "refused": False}]
+        self.s.vod_check(self.s.settings(), 1000, False)
+        self.assertEqual(self.asked, [("http://127.0.0.1:8091", False)])  # remote account not asked
+        self.assertEqual(self.blocked, [])
+        self.assertEqual(self.s.store.recent(5), [])
+        self.assertEqual(self.s.vod_check_at, 1000 + 15 * 60)
+    def test_refused_blocks_and_moves_in_the_background(self):
+        self.answers = [{"checked": True, "refused": True}, {"checked": True, "refused": False}]
+        self.s.vod_check(self.s.settings(), 1000, False)
+        self.assertEqual(self.blocked[0]["port"], 8091)
+        self.assertTrue(self.blocked[0]["background"])
+        self.assertEqual(self.asked[1], ("http://127.0.0.1:8091", True))
+        self.assertEqual(self.s.store.recent(5), [])
+        self.assertEqual(self.s.vod_check_last["refused"], ["Provider A"])
+    def test_still_refused_after_the_move_is_logged(self):
+        self.answers = [{"refused": True}, {"refused": True}]
+        self.s.vod_check(self.s.settings(), 1000, False)
+        self.assertIn("vod_check_unclear", "".join(self.s.store.recent(1)))
+    def test_not_while_watching_or_before_due_or_off(self):
+        self.s.vod_check(self.s.settings(), 1000, True)
+        self.s.vod_check_at = 2000
+        self.s.vod_check(self.s.settings(), 1000, False)
+        self.s.vod_check_at = 0
+        self.settings = {"auto_switch": True, "vod_check_minutes": 0}
+        self.s.vod_check(self.s.settings(), 1000, False)
+        self.assertEqual(self.asked, [])
+    def test_unreachable_failover_is_silent(self):
+        self.answers = [{}]
+        self.s.vod_check(self.s.settings(), 1000, False)
+        self.assertEqual(self.blocked, [])
+        self.assertEqual(self.s.store.recent(5), [])
+    def test_background_ignores_the_first_404_switch_setting(self):
+        self.settings = {"auto_switch": False, "vod_block_switch": False}
+        s = P.Service({"data_dir": self.dir.name, "get_settings": lambda: self.settings})
+        s.accounts, s.accounts_at = [], 1e12
+        self.assertEqual(s.vod_blocked({"port": 1, "budget": 0.5})["detail"], "Switch at the first blocked VOD is off")
+        saved = P.exit_info
+        P.exit_info = lambda timeout=10: HERE
+        try:
+            self.assertEqual(s.vod_blocked({"port": 1, "budget": 0.5, "background": True})["detail"], "Auto switch is off")
+        finally:
+            P.exit_info = saved
+
+class SyncBlocked(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.s = P.Service({"data_dir": self.dir.name, "settings": {}})
+        self.saved = P.publish_blocked, P.read_server_rows, P.exit_info
+        self.published = []
+        P.publish_blocked = lambda hosts, text: self.published.append((hosts, text))
+        P.read_server_rows = lambda: ROWS
+        self.now = P.time.time()
+        self.s.store.set_blocked(P.add_block({}, HERE, "Provider A", self.now), 5)
+    def tearDown(self):
+        P.publish_blocked, P.read_server_rows, P.exit_info = self.saved
+        self.dir.cleanup()
+    def test_shows_a_new_block(self):
+        self.s.sync_blocked({BLOCKED: [], INFO: "List version 4."}, self.now)
+        self.assertEqual(self.published[-1][0], ["us-aaa-wg-001"])
+        self.assertIn("List version 5.", self.published[-1][1])
+        self.assertIn("us-aaa-wg-001", self.s.store.blocked()[0])
+    def test_unblock_from_a_current_page(self):
+        self.s.sync_blocked({BLOCKED: [], INFO: "List version 5."}, self.now)
+        self.assertEqual(self.s.store.blocked(), ({}, 6))
+        self.assertEqual(self.published[-1], ([], "List version 6. No exit is blocked."))
+    def test_quiet_when_in_step(self):
+        text = P.render_blocks(self.s.store.blocked()[0], 5)
+        self.s.sync_blocked({BLOCKED: ["us-aaa-wg-001"], INFO: text}, self.now)
+        self.assertEqual(self.published, [])
+    def test_expires(self):
+        self.s.sync_blocked({BLOCKED: ["us-aaa-wg-001"], INFO: "List version 5."}, self.now + 31 * 86400)
+        self.assertEqual(self.s.store.blocked(), ({}, 6))
+    def test_watch_finds_a_blocked_exit(self):
+        P.exit_info = lambda timeout=10: {"ip": "198.51.100.7", "hostname": "us-aaa-wg-001"}
+        causes = self.s.watch_exit(self.s.store.blocked()[0], self.now)
+        self.assertEqual(causes, ["exit 198.51.100.7 (us-aaa-wg-001) is blocked by Provider A"])
+        self.assertEqual(self.s.watch_exit(self.s.store.blocked()[0], self.now + 1), [])  # once a minute
+        P.exit_info = lambda timeout=10: {"ip": "203.0.113.1", "hostname": "us-bbb-wg-001"}
+        self.assertEqual(self.s.watch_exit(self.s.store.blocked()[0], self.now + 61), [])
+    def test_watch_matches_the_address_too(self):
+        P.exit_info = lambda timeout=10: {"ip": "198.51.100.7", "hostname": None}
+        self.assertTrue(self.s.watch_exit(self.s.store.blocked()[0], self.now))
+    def test_no_blocks_no_lookups(self):
+        P.exit_info = lambda timeout=10: 1 / 0
+        self.assertEqual(self.s.watch_exit({}, self.now), [])
+
+BLOCKED, INFO = P.BLOCKED_FIELD, P.BLOCKED_INFO_FIELD
+
+class Listener(unittest.TestCase):
+    def test_round_trip(self):
+        import socket as plain, threading, urllib.request as request
+        probe = plain.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        saved = P.BLOCK_PORT
+        P.BLOCK_PORT = port
+        with tempfile.TemporaryDirectory() as folder:
+            s = P.Service({"data_dir": folder, "settings": {}})
+            seen, done = [], threading.Event()
+            s.vod_blocked = lambda body: seen.append(body) or {"moved": False, "detail": "test"}
+            s.after_reply = lambda answer: done.set()
+            try:
+                s.listen()
+                self.assertTrue(s.listener)
+                s.listen()  # a second call keeps the same server
+                data = json.dumps({"port": 8091, "title": "movie 1.mkv", "budget": 2}).encode()
+                with request.urlopen(request.Request(f"http://127.0.0.1:{port}{P.BLOCK_PATH}", data=data), timeout=5) as answer:
+                    self.assertEqual(json.loads(answer.read()), {"moved": False, "detail": "test"})
+                self.assertTrue(done.wait(2))
+                self.assertEqual(seen[0]["port"], 8091)
+            finally:
+                s.listener.shutdown()
+                s.listener.server_close()
+                P.BLOCK_PORT = saved
+
 
 if __name__ == "__main__":
     unittest.main()

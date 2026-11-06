@@ -27,6 +27,7 @@ null leaves a field as it was, only [] clears it, and a selection equal to the
 current one answers 200 "settings left unchanged" without reconnecting.
 """
 import http.client
+import http.server
 import ipaddress
 import json
 import logging
@@ -35,6 +36,7 @@ import random
 import re
 import socket
 import struct
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -80,6 +82,10 @@ DEFAULTS = {
     "exit_countries": ["USA"],
     "blocked_countries": [],
     "blocked_cities": [],
+    "blocked_exits": [],
+    "blocked_exits_info": "",
+    "vod_block_switch": True,
+    "vod_check_minutes": 15,
     "min_speed": 0.9,
     "window_seconds": 90,
     "cooldown_minutes": 5,
@@ -149,6 +155,22 @@ Account = namedtuple("Account", "name server_url username password user_agent")
 REJECTION_LINE = re.compile(
     r"\[VOD-Failover\] Marked \w+ on account (?P<account>.+?) as bad for \d+s "
     r"\(\w+\): Streaming error: (?P<code>\d{3}) "
+)
+# m3u-failover asks here when every server of an account refuses VOD on this exit.
+# Everything in Gluetun's namespace shares 127.0.0.1, so only those containers reach it.
+BLOCK_HOST = "127.0.0.1"
+BLOCK_PORT = 9733
+BLOCK_PATH = "/vod-blocked"
+BLOCK_DAYS = 30
+BLOCKED_FIELD = "blocked_exits"
+BLOCKED_INFO_FIELD = "blocked_exits_info"
+LIST_VERSION = re.compile(r"List version (\d+)")
+EXIT_WATCH_SECONDS = 60  # how often the current exit is compared with the blocked list
+EXIT_CACHE_SECONDS = 60  # an exit read this recently is trusted for a block
+RECENT_MOVE_SECONDS = 30  # a request this soon after a move rides on it instead of moving again
+VOD_CHECK_FIRST_SECONDS = 120  # the first background check after a start
+DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_data", PLUGIN_KEY,
 )
 
 
@@ -579,14 +601,19 @@ class Gluetun:
         return json.loads(self._request("GET"))
 
     def selection(self):
+        """(countries, cities, hostnames) Gluetun is set to."""
         selection = self.settings()["provider"]["server_selection"]
-        return selection.get("countries") or [], selection.get("cities") or []
+        return (selection.get("countries") or [], selection.get("cities") or [],
+                selection.get("hostnames") or [])
 
-    def move_to(self, countries, cities):
+    def move_to(self, countries, cities, hostnames=None):
+        """hostnames None leaves Gluetun's server names as they are; [] clears them."""
         settings = self.settings()
         selection = settings["provider"]["server_selection"]
         selection["countries"] = countries
         selection["cities"] = cities
+        if hostnames is not None:
+            selection["hostnames"] = hostnames
         answer = self._request("PUT", settings)
         if b"unchanged" in answer:
             raise RuntimeError("Gluetun left its settings unchanged and did not reconnect")
@@ -734,6 +761,16 @@ def provider_pings(accounts):
         pings[account.name] = connect_ms(*target) if target else None
         hosts[account.name] = f"{target[0]}:{target[1]}" if target else None
     return pings, hosts
+
+
+def ask_vod_check(server_url, forget=False):
+    """m3u-failover's answer to /__vod_check, or {} when it can't be asked."""
+    url = f"{server_url.rstrip('/')}/__vod_check" + ("?forget=1" if forget else "")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            return json.loads(response.read())
+    except Exception:
+        return {}
 
 
 def drop_live(accounts):
@@ -887,13 +924,152 @@ def publish_speed(text):
         close_old_connections()
 
 
-def exit_info():
+def exit_info(timeout=10):
+    """The exit as Mullvad sees it. The hostname is the server's name in Gluetun's list,
+    while the address differs from the server addresses listed there."""
     try:
-        with urllib.request.urlopen(EXIT_CHECK_URL, timeout=10) as response:
+        with urllib.request.urlopen(EXIT_CHECK_URL, timeout=timeout) as response:
             data = json.loads(response.read())
-        return {"ip": data.get("ip"), "city": data.get("city"), "mullvad": data.get("mullvad_exit_ip")}
+        return {
+            "ip": data.get("ip"), "city": data.get("city"), "mullvad": data.get("mullvad_exit_ip"),
+            "hostname": data.get("mullvad_exit_ip_hostname"),
+        }
     except Exception as error:
         return {"error": type(error).__name__}
+
+
+def read_server_rows(path=SERVERS_FILE):
+    """[{hostname, city, country}] of the WireGuard servers in Gluetun's list, or []."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            servers = json.load(handle)["servers"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    return [
+        {"hostname": s["hostname"], "city": s["city"], "country": s["country"]}
+        for s in servers
+        if s.get("hostname") and s.get("city") and s.get("country")
+        and s.get("vpn", "wireguard") == "wireguard"
+    ]
+
+
+def rotate(values, current):
+    """The values after the current one first, the current one last."""
+    values = list(values)
+    if current in values:
+        position = values.index(current)
+        return values[position + 1:] + values[:position + 1]
+    return values
+
+
+def locate(hostname, servers):
+    """The server row for a hostname, or {} when it isn't in Gluetun's list."""
+    return next((s for s in servers if s["hostname"] == hostname), {}) if hostname else {}
+
+
+def plan_server(servers, here, countries, cities, blocked_countries=(), blocked_cities=(),
+                blocked_hosts=(), choose=None):
+    """A server row to move to, or None when every allowed server is excluded.
+
+    Gluetun can't exclude a server, so with blocked exits the plugin names one itself.
+    Cities are tried in the order picked, starting after the current one; with countries
+    only, the next country, then the current one. Any server but the current one will do,
+    including another in the same city, because a provider refuses addresses, not places.
+    """
+    blocked_countries = {c.lower() for c in blocked_countries}
+    blocked_cities = {c.lower() for c in blocked_cities}
+    usable = [
+        s for s in servers
+        if s["country"].lower() not in blocked_countries and s["city"].lower() not in blocked_cities
+        and s["hostname"] not in blocked_hosts and s["hostname"] != here.get("hostname")
+    ]
+    if cities:
+        key, order = "city", rotate(cities, str(here.get("city") or "").lower())
+    else:
+        key, order = "country", rotate(countries, str(here.get("country") or "").lower())
+    for value in order:
+        pool = sorted(s["hostname"] for s in usable if s[key].lower() == value)
+        if pool:
+            return locate((choose or random.choice)(pool), usable)
+    return None
+
+
+def active_blocks(entries, now):
+    """Blocked exits that have not expired yet, keyed by server name."""
+    return {host: entry for host, entry in (entries or {}).items() if float(entry.get("expires") or 0) > now}
+
+
+def add_block(entries, here, account, now, days=BLOCK_DAYS):
+    """The entries with this exit blocked by the account. A repeat adds the account and
+    starts the days again."""
+    key = here.get("hostname") or here.get("ip")
+    entries = {host: dict(entry) for host, entry in (entries or {}).items()}
+    entry = entries.get(key, {})
+    accounts = list(dict.fromkeys([*(entry.get("accounts") or []), account]))
+    entries[key] = {
+        "hostname": here.get("hostname") or entry.get("hostname"),
+        "ip": here.get("ip") or entry.get("ip"),
+        "city": here.get("city") or entry.get("city"),
+        "accounts": accounts,
+        "at": now,
+        "expires": now + days * 86400,
+    }
+    return entries
+
+
+def day_stamp(moment):
+    return time.strftime("%b %-d", time.localtime(moment))
+
+
+def render_blocks(entries, version):
+    """The details box: one line per blocked exit, then the list version that tells a Save
+    from an up-to-date page apart from one opened before the list last changed."""
+    lines = []
+    for host, entry in sorted(entries.items(), key=lambda item: item[1].get("at") or 0):
+        place = ", ".join(str(part) for part in (entry.get("hostname") or host, entry.get("city")) if part)
+        lines.append(
+            f"{entry.get('ip') or 'address unknown'} - {place} - blocked by "
+            f"{', '.join(entry.get('accounts') or ['?'])} on {day_stamp(entry.get('at') or 0)}"
+            f" - expires {day_stamp(entry.get('expires') or 0)}"
+        )
+    lines.append(f"List version {version}." + (" No exit is blocked." if not entries else ""))
+    return "\n".join(lines)
+
+
+def reconcile(entries, version, selected, posted, servers, now, days=BLOCK_DAYS):
+    """(entries, version) after the user's last Save. Only a Save from a page showing the
+    current list version counts: an older page never showed the newest entries, so their
+    absence there is no request to unblock them. A server picked by hand is blocked as 'you'."""
+    found = LIST_VERSION.search(str(posted or ""))
+    if not found or int(found[1]) != version:
+        return entries, version
+    selected = [str(host) for host in selected or []]
+    kept = {host: entry for host, entry in entries.items() if host in selected}
+    for host in selected:
+        if host not in kept:
+            row = locate(host, servers)
+            kept[host] = {
+                "hostname": host, "ip": None, "city": row.get("city"), "accounts": ["you"],
+                "at": now, "expires": now + days * 86400,
+            }
+    if kept.keys() == entries.keys():
+        return entries, version
+    return kept, version + 1
+
+
+def publish_blocked(hosts, text):
+    """The blocked list into the form, like publish_speed: no save hooks, row locked."""
+    from django.db import close_old_connections, transaction
+    from apps.plugins.models import PluginConfig
+    close_old_connections()
+    try:
+        with transaction.atomic():
+            config = PluginConfig.objects.select_for_update().filter(key=PLUGIN_KEY).first()
+            if config:
+                settings = {**(config.settings or {}), BLOCKED_FIELD: list(hosts), BLOCKED_INFO_FIELD: text}
+                PluginConfig.objects.filter(pk=config.pk).update(settings=settings)
+    finally:
+        close_old_connections()
 
 
 class Store:
@@ -905,6 +1081,16 @@ class Store:
         self.status_path = os.path.join(data_dir, "status.json")
         self.relays_path = os.path.join(data_dir, "relays.json")
         self.speed_path = os.path.join(data_dir, "speedtest.json")
+        self.blocked_path = os.path.join(data_dir, "blocked.json")
+        self.blocked_lock = threading.Lock()
+
+    def blocked(self):
+        """(entries, version) of the blocked exits, expired ones included."""
+        data = self._read_json(self.blocked_path)
+        return dict(data.get("entries") or {}), int(data.get("version") or 0)
+
+    def set_blocked(self, entries, version):
+        self._write_json(self.blocked_path, {"version": version, "entries": entries})
 
     def _read_json(self, path):
         try:
@@ -981,11 +1167,43 @@ class Store:
 def switch_exit(settings, store, cause, left=None):
     """Move to the next allowed exit. Returns the city, or None if nothing moved."""
     gluetun = Gluetun(settings["gluetun_url"])
-    countries, cities = gluetun.selection()
+    countries, cities, hostnames = gluetun.selection()
     allowed_countries = parse_exits(settings["exit_countries"])
     allowed_cities = parse_exits(settings["exits"])
     blocked_countries = parse_exits(settings["blocked_countries"])
     blocked_cities = parse_exits(settings["blocked_cities"])
+    blocked_hosts = set(active_blocks(store.blocked()[0], time.time()))
+    if blocked_hosts or hostnames:
+        # Only a named server can avoid a blocked one. Once Gluetun holds a name, later
+        # moves name one too, so the old name can't linger beside a city or country.
+        servers = read_server_rows()
+        if not servers:
+            store.log("no_exit", detail="could not read Gluetun's server list to avoid blocked exits")
+            return None
+        here = locate((left or {}).get("hostname"), servers) or locate(
+            hostnames[0] if len(hostnames) == 1 else None, servers,
+        )
+        server = plan_server(
+            servers, here, allowed_countries, allowed_cities,
+            blocked_countries, blocked_cities, blocked_hosts,
+        )
+        if server is None:
+            store.log("no_exit", detail="every allowed server is blocked or excluded",
+                      blocked=len(blocked_hosts))
+            return None
+        label = f"{server['city']} ({server['hostname']})"
+        store.add_switch(time.time())
+        try:
+            gluetun.move_to([], [], [server["hostname"]])
+        except Exception as error:
+            store.log("failed", target=label, detail=str(error)[:300])
+            return None
+        store.log(
+            "switched", cause=cause,
+            before={"countries": countries, "cities": cities, "hostnames": hostnames},
+            after=label, left=left,
+        )
+        return label
     relays = None
     if needs_relays(allowed_countries, allowed_cities, blocked_countries, blocked_cities):
         relays = load_relays(store)
@@ -1040,6 +1258,13 @@ class Service:
         self.slow_now = []
         self.moved_for = {}
         self.feeds_noted = set()
+        self.switch_lock = threading.Lock()  # the monitor and m3u-failover's requests take turns
+        self.exit_seen, self.exit_seen_at = {}, 0.0
+        self.moved_at = 0.0
+        self.listener = None
+        self.stop_event = None
+        self.vod_check_at = time.time() + VOD_CHECK_FIRST_SECONDS
+        self.vod_check_last = {}
 
     def settings(self):
         getter = self.context.get("get_settings")
@@ -1047,14 +1272,194 @@ class Service:
         return {**DEFAULTS, **(stored or {})}
 
     def run(self, stop_event):
+        self.stop_event = stop_event
         self.store.log("started")
         while not stop_event.is_set():
             try:
+                self.listen()
                 self.tick(stop_event)
             except Exception:
                 logger.exception("Gluetun AutoSwitch tick failed")
             stop_event.wait(TICK_SECONDS)
+        if self.listener:
+            self.listener.shutdown()
+            self.listener.server_close()
+            self.listener = None
         self.store.log("stopped")
+
+    def listen(self):
+        """Opens the port m3u-failover asks on. During a reload the old service may hold it
+        for a moment, so a failed bind is simply tried again on the next tick."""
+        if self.listener:
+            return
+        try:
+            server = http.server.ThreadingHTTPServer((BLOCK_HOST, BLOCK_PORT), block_handler(self))
+        except OSError as error:
+            logger.warning("Gluetun AutoSwitch: port %s not available yet: %s", BLOCK_PORT, error)
+            return
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, name="gluetun_autoswitch_listener", daemon=True).start()
+        self.listener = server
+
+    def current_exit(self, now, max_age=EXIT_CACHE_SECONDS):
+        """The exit as last read, asking Mullvad again when the reading is older than max_age."""
+        if not self.exit_seen.get("ip") or now - self.exit_seen_at >= max_age:
+            info = exit_info(timeout=3)
+            if info.get("ip"):
+                self.exit_seen, self.exit_seen_at = info, now
+            return info
+        return self.exit_seen
+
+    def sync_blocked(self, settings, now):
+        """Drops expired entries, applies the user's last Save, and shows the result."""
+        with self.store.blocked_lock:
+            entries, stored = self.store.blocked()
+            active, version = active_blocks(entries, now), stored
+            if active.keys() != entries.keys():
+                self.store.log("unblocked", exits=sorted(set(entries) - set(active)), detail="30 days passed")
+                version += 1
+            selected = settings.get(BLOCKED_FIELD) or []
+            kept, version = reconcile(
+                active, version, selected, settings.get(BLOCKED_INFO_FIELD),
+                read_server_rows() if set(selected) - set(active) else [], now,
+            )
+            removed, added = sorted(set(active) - set(kept)), sorted(set(kept) - set(active))
+            if removed:
+                self.store.log("unblocked", exits=removed, detail="removed by the user")
+            if added:
+                self.store.log("blocked_exit", exits=added, accounts=["you"])
+            if version != stored:
+                self.store.set_blocked(kept, version)
+        hosts, text = sorted(kept), render_blocks(kept, version)
+        if sorted(settings.get(BLOCKED_FIELD) or []) != hosts or settings.get(BLOCKED_INFO_FIELD) != text:
+            publish_blocked(hosts, text)
+        return kept
+
+    def watch_exit(self, blocked, now):
+        """Urgent causes when the exit is on the blocked list, as after Gluetun restarts
+        and picks its own random server."""
+        if not blocked or now - self.exit_seen_at < EXIT_WATCH_SECONDS:
+            return []
+        here = self.current_exit(now, max_age=0)
+        entry = blocked.get(here.get("hostname")) or next(
+            (e for e in blocked.values() if here.get("ip") and e.get("ip") == here.get("ip")), None,
+        )
+        if not entry:
+            return []
+        return [f"exit {here.get('ip')} ({here.get('hostname')}) is blocked by {', '.join(entry.get('accounts') or [])}"]
+
+    def vod_blocked(self, request):
+        """m3u-failover found an account refusing VOD on this exit. Blocks the exit and moves,
+        waiting for the new tunnel within the time m3u-failover can hold the player."""
+        started = time.monotonic()
+        budget = min(max(float(request.get("budget") or 0), 0.5), 20)
+        account = self.account_name(request) or "unknown account"
+        title = str(request.get("title") or "")[:80]
+        settings = self.settings()
+        if not settings["vod_block_switch"] and not request.get("background"):
+            return {"moved": False, "detail": "Switch at the first blocked VOD is off"}
+        if not self.switch_lock.acquire(timeout=budget):
+            return {"moved": False, "detail": "another switch is still running"}
+        try:
+            now = time.time()
+            if now - self.moved_at < RECENT_MOVE_SECONDS:
+                return {"moved": True, "ready": True, "detail": "the exit moved moments ago"}
+            here = self.current_exit(now)
+            if not here.get("ip"):
+                return {"moved": False, "detail": "the current exit could not be read"}
+            cause = f"{account} refused VOD on {here['ip']} ({title})"
+            if not settings["auto_switch"]:
+                self.store.log("would_switch", causes=[cause], exit=here)
+                return {"moved": False, "detail": "Auto switch is off"}
+            reason = held_back(self.store.switches(), now, 0, int(settings["max_switches_per_hour"]))
+            if reason:
+                self.store.log("held_back", reason=reason, causes=[cause])
+                return {"moved": False, "detail": reason}
+            with self.store.blocked_lock:
+                entries, version = self.store.blocked()
+                self.store.set_blocked(add_block(active_blocks(entries, now), here, account, now), version + 1)
+            self.store.log("blocked_exit", exits=[here.get("hostname") or here["ip"]], ip=here["ip"],
+                           accounts=[account], title=title)
+            if not switch_exit(settings, self.store, cause=[cause], left=here):
+                return {"moved": False, "detail": "no other exit to move to"}
+            self.after_move(now)
+            arrived = {}
+            while time.monotonic() - started < budget:
+                arrived = exit_info(timeout=1.5)
+                if arrived.get("ip") and arrived["ip"] != here["ip"]:
+                    self.exit_seen, self.exit_seen_at = arrived, time.time()
+                    self.store.log("exit", **arrived)
+                    return {"moved": True, "ready": True, "exit": arrived.get("city")}
+                time.sleep(0.3)
+            return {"moved": True, "ready": False, "detail": "the tunnel was not back in time"}
+        finally:
+            self.switch_lock.release()
+
+    def vod_check(self, settings, now, watching):
+        """Silent background check while nobody is watching: m3u-failover asks one byte of
+        titles that played before. Nothing is logged unless they are refused; then the exit
+        is blocked and moves, and the check runs again on the new exit."""
+        minutes = float(settings["vod_check_minutes"] or 0)
+        if minutes <= 0 or watching or now < self.vod_check_at:
+            return
+        self.vod_check_at = now + minutes * 60
+        self.vod_check_last = {"at": now, "refused": []}
+        for account in self.current_accounts(now):
+            parts = urllib.parse.urlsplit(account.server_url)
+            if parts.hostname not in LOCAL_HOSTS:
+                continue
+            if not ask_vod_check(account.server_url).get("refused"):
+                continue
+            self.vod_check_last["refused"].append(account.name)
+            answer = self.vod_blocked({"port": parts.port, "title": "background check", "budget": 20,
+                                       "background": True})
+            self.after_reply(answer)
+            if answer.get("moved") and answer.get("ready"):
+                again = ask_vod_check(account.server_url, forget=True)
+                if again.get("refused"):
+                    self.store.log("vod_check_unclear", account=account.name,
+                                   detail="still refused on the new exit: those titles may be gone; forgot them")
+            return  # one move per check is enough: the next check sees the new exit
+
+    def after_reply(self, answer):
+        """Work that must not keep the player waiting: closing the live streams that died
+        with the old exit, and showing the new block in the form."""
+        if not answer.get("moved") or answer.get("detail") == "the exit moved moments ago":
+            return
+        if not answer.get("ready"):
+            for _ in range(20):
+                if exit_info(timeout=2).get("ip"):
+                    break
+                time.sleep(1)
+            self.store.log("exit", **exit_info())
+        self.drop_streams(time.time())
+        try:
+            self.sync_blocked(self.settings(), time.time())
+        except Exception:
+            logger.exception("Gluetun AutoSwitch: showing the blocked exits failed")
+
+    def account_name(self, request):
+        """Dispatcharr's name for the account behind an m3u-failover port."""
+        port = str(request.get("port") or "")
+        for account in self.current_accounts(time.time()):
+            parts = urllib.parse.urlsplit(account.server_url)
+            if parts.hostname in LOCAL_HOSTS and str(parts.port or "") == port:
+                return account.name
+        return str(request.get("account") or "") or None
+
+    def after_move(self, now):
+        """Forget what was measured on the old exit."""
+        self.moved_at = time.time()
+        self.exit_seen, self.exit_seen_at = {}, 0.0
+        self.live.clear()
+        self.vod.clear()
+        self.rejections.clear()
+        self.blocked.clear()
+        self.refused_streak = 0
+        self.probe_at = now
+        self.speed_streak, self.speed_cause = 0, []
+        self.speed_due = now + SPEED_SETTLE_SECONDS
+        self.moved_for.update({name: now for name in self.slow_now})
 
     def tick(self, stop_event):
         from core.utils import RedisClient
@@ -1076,13 +1481,19 @@ class Service:
             f"{account} rejected {count} times"
             for account, count in counts.items() if count >= retries
         ]
+        blocked_exits = self.sync_blocked(settings, now)
+        urgent += self.watch_exit(blocked_exits, now)
         polite = self.check_blocked(lines, now) + self.probe_accounts(settings, now)
         polite += self.speed_health(settings, now, bool(readings))
+        self.vod_check(settings, now, bool(readings))
         self.store.set_status({
             "at": now, "streams": readings, "rejections": counts,
             "login_refusal_rounds": self.refused_streak,
             "failed_speed_tests": self.speed_streak,
             "blocked_sources": [feed_of(url) for url in self.blocked],
+            "blocked_exits": sorted(blocked_exits),
+            "listening": bool(self.listener),
+            "last_vod_check": self.vod_check_last,
             "auto_switch": bool(settings["auto_switch"]),
         })
         action, causes = route(urgent, polite, bool(readings))
@@ -1237,9 +1648,14 @@ class Service:
             self.store.log("repair_gave_up", attempts=self.repairs)
             self.repairs = None
             return
-        self.repairs += 1
-        self.repair_at = now + REPAIR_SECONDS
-        switch_exit(settings, self.store, cause="the tunnel did not come back")
+        if not self.switch_lock.acquire(blocking=False):
+            return
+        try:
+            self.repairs += 1
+            self.repair_at = now + REPAIR_SECONDS
+            switch_exit(settings, self.store, cause="the tunnel did not come back")
+        finally:
+            self.switch_lock.release()
 
     def read_live(self, redis, now, window):
         from apps.proxy.live_proxy.redis_keys import RedisKeys
@@ -1318,6 +1734,14 @@ class Service:
         return self.required[session]
 
     def act(self, settings, causes, now, stop_event):
+        if not self.switch_lock.acquire(blocking=False):
+            return  # m3u-failover's request is moving the exit right now
+        try:
+            self.act_locked(settings, causes, now, stop_event)
+        finally:
+            self.switch_lock.release()
+
+    def act_locked(self, settings, causes, now, stop_event):
         reason = held_back(
             self.store.switches(), now,
             float(settings["cooldown_minutes"]) * 60, int(settings["max_switches_per_hour"]),
@@ -1333,15 +1757,7 @@ class Service:
         moved = switch_exit(settings, self.store, cause=causes, left=left)
         self.repairs, self.repair_at = 0, now + REPAIR_SECONDS
         if moved:
-            self.live.clear()
-            self.vod.clear()
-            self.rejections.clear()
-            self.blocked.clear()
-            self.refused_streak = 0
-            self.probe_at = now
-            self.speed_streak, self.speed_cause = 0, []
-            self.speed_due = now + SPEED_SETTLE_SECONDS
-            self.moved_for.update({name: now for name in self.slow_now})
+            self.after_move(now)
             stop_event.wait(DROP_AFTER_SECONDS)
             self.drop_streams(now)
             stop_event.wait(20 - DROP_AFTER_SECONDS)
@@ -1360,6 +1776,44 @@ class Service:
         if key != self.announced:  # one journal line per episode, not one per tick
             self.announced = key
             self.store.log(event, **details)
+
+
+def block_handler(service):
+    """Requests from m3u-failover: POST /vod-blocked {"port", "account", "title", "budget"}."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def reply(self, answer):
+            data = json.dumps(answer).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+            self.wfile.flush()
+
+        def do_GET(self):
+            self.reply({"service": "gluetun_autoswitch", "path": BLOCK_PATH})
+
+        def do_POST(self):
+            if self.path != BLOCK_PATH:
+                return self.reply({"moved": False, "detail": "unknown path"})
+            try:
+                length = min(int(self.headers.get("Content-Length") or 0), 4096)
+                request = json.loads(self.rfile.read(length) or b"{}")
+                answer = service.vod_blocked(request if isinstance(request, dict) else {})
+            except Exception as error:
+                logger.exception("Gluetun AutoSwitch: VOD block request failed")
+                answer = {"moved": False, "detail": f"error: {type(error).__name__}"}
+            try:
+                self.reply(answer)
+            finally:
+                service.after_reply(answer)
+
+    return Handler
 
 
 def read_servers(path=SERVERS_FILE):
@@ -1387,7 +1841,28 @@ def _options(values, saved):
     return [{"value": v, "label": v} for v in dict.fromkeys([*values, *saved])]
 
 
-def build_fields(fields, servers, enabled, settings):
+def exit_options(rows, countries, entries, saved):
+    """Every server in the shown countries, so a new block never needs a reload: Dispatcharr
+    only accepts values it offers, and options are fixed until the plugin reloads. Blocked
+    ones come first and carry their address and accounts."""
+    countries = {c.lower() for c in countries}
+    shown = [r for r in rows if r["country"].lower() in countries or r["hostname"] in entries]
+    by_host = {r["hostname"]: r for r in rows}
+    options = []
+    for host in sorted(entries, key=lambda h: entries[h].get("at") or 0):
+        entry, row = entries[host], by_host.get(host, {})
+        parts = [host, row.get("city") or entry.get("city"), entry.get("ip"),
+                 f"blocked by {', '.join(entry.get('accounts') or [])}"]
+        options.append({"value": host, "label": " - ".join(str(p) for p in parts if p)})
+    for row in sorted(shown, key=lambda r: (r["city"], r["hostname"])):
+        if row["hostname"] not in entries:
+            options.append({"value": row["hostname"], "label": f"{row['hostname']} - {row['city']}"})
+    offered = {o["value"] for o in options}
+    options += [{"value": v, "label": v} for v in saved if v not in offered]
+    return options
+
+
+def build_fields(fields, servers, enabled, settings, rows=(), entries=None):
     """Fields with their lists filled. Cities follow the saved Allowed countries."""
     fields = json.loads(json.dumps(fields))
     saved = lambda field: settings.get(field["id"], field.get("default"))  # noqa: E731
@@ -1403,6 +1878,8 @@ def build_fields(fields, servers, enabled, settings):
             field["options"] = _options(countries, names(field))
         elif field["id"] in ("exits", "blocked_cities"):
             field["options"] = _options(cities, names(field))
+        elif field["id"] == BLOCKED_FIELD:
+            field["options"] = exit_options(rows, shown, entries or {}, names(field))
         elif field["id"] == "reject_codes":
             codes = sorted(parse_codes(saved(field)) | set(REJECT_CODE_OPTIONS))
             field["options"] = _options([str(code) for code in codes], [])
@@ -1418,7 +1895,7 @@ def _saved_settings():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.6.1"
+    version = "1.7"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property
@@ -1432,7 +1909,15 @@ class Plugin:
         except Exception:
             logger.exception("Could not read the saved settings for the country and city lists")
             settings = {}
-        return build_fields(fields, read_servers(), enabled_countries(os.environ.get(COUNTRIES_ENV)), settings)
+        try:
+            entries = active_blocks(Store(DATA_DIR).blocked()[0], time.time())
+        except Exception:
+            logger.exception("Could not read the blocked exits")
+            entries = {}
+        return build_fields(
+            fields, read_servers(), enabled_countries(os.environ.get(COUNTRIES_ENV)), settings,
+            read_server_rows(), entries,
+        )
 
     def on_leader_acquired(self, context):
         service = Service(context)
@@ -1444,7 +1929,8 @@ class Plugin:
         store = Store(context["data_dir"])
         if action == "status":
             status = store.status()
-            countries, cities = Gluetun(settings["gluetun_url"]).selection()
+            countries, cities, hostnames = Gluetun(settings["gluetun_url"]).selection()
+            entries, version = store.blocked()
             age = time.time() - float(status.get("at") or 0)
             return {
                 "status": "ok",
@@ -1453,6 +1939,9 @@ class Plugin:
                 "exit": exit_info(),
                 "gluetun_countries": countries,
                 "gluetun_cities": cities,
+                "gluetun_servers": hostnames,
+                "blocked_exits": render_blocks(active_blocks(entries, time.time()), version).splitlines(),
+                "listening_for_m3u_failover": bool(status.get("listening")),
                 "streams": status.get("streams", []),
                 "rejections": status.get("rejections", {}),
                 "login_refusal_rounds": status.get("login_refusal_rounds", 0),
@@ -1460,9 +1949,17 @@ class Plugin:
                 "blocked_sources": status.get("blocked_sources", []),
                 "recent": store.recent(),
             }
+        if action == "clear_blocked":
+            with store.blocked_lock:
+                entries, version = store.blocked()
+                store.set_blocked({}, version + 1)
+            publish_blocked([], render_blocks({}, version + 1))
+            store.log("unblocked", exits=sorted(entries), detail="cleared by the user")
+            return {"status": "ok", "message": f"Cleared {len(entries)} blocked exit(s). Refresh the page."}
         if action == "change_exit":
-            before = exit_info().get("ip")
-            target = switch_exit(settings, store, cause="manual", left={"ip": before})
+            left = exit_info()
+            before = left.get("ip")
+            target = switch_exit(settings, store, cause="manual", left=left)
             if not target:
                 return {"status": "error", "message": "Did not move. See Check status."}
             now_at = {}
