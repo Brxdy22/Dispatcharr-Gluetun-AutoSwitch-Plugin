@@ -618,6 +618,84 @@ class Usual(unittest.TestCase):
     def test_other_events_and_failed_pings_are_ignored(self):
         self.assertEqual(P.usual_pings([{"event": "switched"}, {"event": "speed_test", "providers": {"ProviderA": None}}]), {})
 
+class MovedMirror(unittest.TestCase):
+    def row(self, ping, host, city="A", problems=()):
+        return {"event": "speed_test", "city": city, "providers": {"M": ping},
+                "provider_hosts": {"M": host}, "problems": list(problems)}
+
+    def test_old_host_does_not_count(self):
+        rows = [self.row(58, "cf:80"), self.row(58, "cf:80")]
+        self.assertEqual(P.usual_pings(rows, {"M": "direct:80"}), {})
+
+    def test_journal_without_hosts_does_not_count(self):
+        rows = [{"event": "speed_test", "providers": {"M": 58}}] * 3
+        self.assertEqual(P.usual_pings(rows, {"M": "direct:80"}), {})
+
+    def test_same_host_counts(self):
+        rows = [self.row(58, "x:80"), self.row(60, "x:80")]
+        self.assertEqual(P.usual_pings(rows, {"M": "x:80"}), {"M": 60})
+
+    def test_rise_on_two_exits_is_the_new_usual(self):
+        flag = ["M ping 200 ms (usually 58)"]
+        rows = [self.row(58, "x:80"), self.row(58, "x:80"),
+                self.row(200, "x:80", "A", flag), self.row(190, "x:80", "B", flag)]
+        self.assertEqual(P.usual_pings(rows, {"M": "x:80"}), {"M": 200})
+
+    def test_rise_on_one_exit_is_that_exit(self):
+        flag = ["M ping 200 ms (usually 58)"]
+        rows = [self.row(58, "x:80"), self.row(58, "x:80"),
+                self.row(200, "x:80", "A", flag), self.row(210, "x:80", "A", flag)]
+        self.assertEqual(P.usual_pings(rows, {"M": "x:80"}), {"M": 58})
+
+
+class Suspects(unittest.TestCase):
+    def live(self, name, speed):
+        return {"kind": "live", "name": name, "speed": speed}
+
+    def test_one_slow_among_healthy_is_the_feed(self):
+        self.assertEqual(P.exit_suspects([self.live("a", 0.85), self.live("b", 1.0)], 0.9), [])
+
+    def test_all_slow_is_the_exit(self):
+        self.assertEqual(len(P.exit_suspects([self.live("a", 0.85), self.live("b", 0.8)], 0.9)), 2)
+
+    def test_alone_can_still_be_the_exit(self):
+        self.assertEqual(len(P.exit_suspects([self.live("a", 0.85)], 0.9)), 1)
+
+    def test_other_kind_is_no_proof(self):
+        vod = {"kind": "vod", "name": "m", "speed": 1.2}
+        self.assertEqual(len(P.exit_suspects([self.live("a", 0.85), vod], 0.9)), 1)
+
+    def test_unmeasured_is_no_proof(self):
+        self.assertEqual(len(P.exit_suspects([self.live("a", 0.85), self.live("b", None)], 0.9)), 1)
+
+
+class OneMovePerStream(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.service = P.Service({"data_dir": self.dir.name, "settings": {}})
+        self.slow = [{"kind": "live", "name": "a", "speed": 0.8}]
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def events(self):
+        return [e for e in self.service.store.entries() if e.get("event") == "feed_slow"]
+
+    def test_first_time_moves(self):
+        self.assertEqual(len(self.service.slow_streams(self.slow, 0.9, 1000)), 1)
+
+    def test_still_slow_after_a_move_does_not(self):
+        self.service.moved_for["a"] = 1000
+        self.assertEqual(self.service.slow_streams(self.slow, 0.9, 1100), [])
+        self.service.slow_streams(self.slow, 0.9, 1110)
+        self.assertEqual(len(self.events()), 1)  # one journal line, not one per tick
+
+    def test_forgotten_after_a_while(self):
+        self.service.moved_for["a"] = 1000
+        now = 1000 + P.FEED_MEMORY_SECONDS
+        self.assertEqual(len(self.service.slow_streams(self.slow, 0.9, now)), 1)
+
+
 class Schedule(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

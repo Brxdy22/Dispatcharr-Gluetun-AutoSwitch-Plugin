@@ -1,6 +1,6 @@
 {
   "name": "Gluetun AutoSwitch",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -78,7 +78,7 @@
       "label": "Minimum speed (x real time)",
       "type": "number",
       "default": 0.9,
-      "help_text": "A stream counts as slow below this. 1.0 is exactly real time."
+      "help_text": "A stream counts as slow below this. 1.0 is exactly real time. It only moves the exit when no other stream of the same kind is keeping up, and once per stream every 30 minutes, because a stream still slow on a new exit is the feed's problem."
     },
     {
       "id": "window_seconds",
@@ -217,7 +217,7 @@
       "label": "Provider ping limit (x usual)",
       "type": "number",
       "default": 2,
-      "help_text": "Fails when a provider's ping is this many times its usual, taken from recent healthy tests. Compared per provider, because some are simply far away. 0 turns this check off."
+      "help_text": "Fails when a provider's ping is this many times its usual, taken from recent healthy tests of the same server. Compared per provider, because some are simply far away. A rise seen from two different exits becomes the new usual. 0 turns this check off."
     }
   ],
   "actions": [

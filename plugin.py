@@ -124,6 +124,8 @@ SPEED_RETEST_SECONDS = 300  # a failed test is confirmed soon, not an hour later
 SPEED_SETTLE_SECONDS = 120  # a new exit gets its own test shortly after a switch
 BASELINE_TESTS = 20
 BASELINE_MINIMUM = 2
+FEED_MEMORY_SECONDS = 1800  # a stream gets one exit change per this long
+DROP_AFTER_SECONDS = 5  # time for the tunnel to come back before streams reconnect
 LOG_PATH = "/data/logs/dispatcharr.log"
 REFUSED_STATUSES = frozenset(range(520, 528))
 BLOCK_PAGE_MARKER = b"Website Access Blocked"
@@ -721,14 +723,40 @@ def provider_target(server_url, proxy_status):
 
 
 def provider_pings(accounts):
-    pings = {}
+    """({account: ping}, {account: 'host:port'}). The host matters: m3u-failover can move an
+    account to another mirror, and a ping only compares with pings of the same host."""
+    pings, hosts = {}, {}
     for account in accounts:
         local = urllib.parse.urlsplit(account.server_url).hostname in LOCAL_HOSTS
         target = provider_target(
             account.server_url, read_proxy_status(account.server_url) if local else None,
         )
         pings[account.name] = connect_ms(*target) if target else None
-    return pings
+        hosts[account.name] = f"{target[0]}:{target[1]}" if target else None
+    return pings, hosts
+
+
+def drop_live(accounts):
+    """Live connections through m3u-failover, closed after an exit change. They died with the
+    old exit, and Dispatcharr would otherwise wait out its read timeout before reconnecting."""
+    dropped = 0
+    for url in {account.server_url.rstrip("/") for account in accounts}:
+        if urllib.parse.urlsplit(url).hostname not in LOCAL_HOSTS:
+            continue
+        try:
+            with urllib.request.urlopen(f"{url}/__drop_live", timeout=3) as response:
+                dropped += int(json.loads(response.read()).get("dropped") or 0)
+        except Exception as error:
+            logger.warning("Gluetun AutoSwitch: could not drop live streams at %s: %s", url, error)
+    return dropped
+
+
+def exit_suspects(readings, minimum):
+    """Slow streams an exit could explain. Another stream of the same kind keeping up on the
+    same tunnel means the exit is fine and that feed is the problem."""
+    measured = [r for r in readings if r["speed"] is not None]
+    healthy = {r["kind"] for r in measured if r["speed"] >= minimum}
+    return [r for r in measured if r["speed"] < minimum and r["kind"] not in healthy]
 
 
 def local_stamp():
@@ -789,15 +817,30 @@ def judge(result, settings, usual):
     return problems
 
 
-def usual_pings(entries):
+def usual_pings(entries, hosts=None):
     """Median provider ping over recent healthy tests, from journal entries oldest first.
-    A test with problems is left out, so a bad exit can't raise its own limit."""
-    samples = {}
+    A test with problems is left out, so a bad exit can't raise its own limit. With hosts,
+    only tests of each account's current host count. A rise seen from two different exits
+    came from the provider, not the exit, so those readings become the new usual."""
+    samples, streaks = {}, {}
     for entry in entries:
-        if entry.get("event") == "speed_test" and not entry.get("problems"):
-            for name, value in (entry.get("providers") or {}).items():
-                if value is not None:
-                    samples.setdefault(name, []).append(value)
+        if entry.get("event") != "speed_test":
+            continue
+        problems = entry.get("problems") or []
+        for name, value in (entry.get("providers") or {}).items():
+            if value is None:
+                continue
+            if hosts is not None and (entry.get("provider_hosts") or {}).get(name) != hosts.get(name):
+                continue
+            if any(str(problem).startswith(f"{name} ping ") for problem in problems):
+                streak = streaks.setdefault(name, [])
+                streak.append((entry.get("city"), value))
+                if len({city for city, _ in streak}) >= 2:
+                    samples[name] = [reading for _, reading in streak]
+                continue
+            streaks.pop(name, None)
+            if not problems:
+                samples.setdefault(name, []).append(value)
     usual = {}
     for name, values in samples.items():
         recent = sorted(values[-BASELINE_TESTS:])
@@ -808,6 +851,7 @@ def usual_pings(entries):
 
 def run_speed_test(store, accounts, settings):
     info = exit_info()
+    pings, hosts = provider_pings(accounts)
     result = {
         "when": local_stamp(),
         "city": info.get("city"),
@@ -815,10 +859,11 @@ def run_speed_test(store, accounts, settings):
         "ping": connect_ms(SPEED_HOST, 443, tries=5),
         "download": measure_download(),
         "upload": measure_upload(),
-        "providers": provider_pings(accounts),
+        "providers": pings,
+        "provider_hosts": hosts,
         "streams": len(store.status().get("streams", [])),
     }
-    result["problems"] = judge(result, settings, usual_pings(store.entries()))
+    result["problems"] = judge(result, settings, usual_pings(store.entries(), hosts))
     result["unclear"] = result["download"] is None or result["ping"] is None
     result["text"] = format_speed(result)
     store.set_speed({"at": time.time(), "text": result["text"], "result": result})
@@ -992,6 +1037,9 @@ class Service:
         self.speed_due = None
         self.speed_streak = 0
         self.speed_cause = []
+        self.slow_now = []
+        self.moved_for = {}
+        self.feeds_noted = set()
 
     def settings(self):
         getter = self.context.get("get_settings")
@@ -1018,7 +1066,8 @@ class Service:
         minimum = float(settings["min_speed"])
         self.check_tunnel(settings, now)
         self.sync_speed(settings)
-        slow = [r for r in readings if r["speed"] is not None and r["speed"] < minimum]
+        slow = self.slow_streams(readings, minimum, now)
+        self.slow_now = [r["name"] for r in slow]
         urgent = [f"{r['name']} at {r['speed']:.2f}x" for r in slow]
         lines = self.log_tail.read()
         counts = self.read_rejections(settings, now, lines)
@@ -1043,6 +1092,29 @@ class Service:
             self.announce("viewers", "held_back", reason="someone is watching", causes=causes)
         else:
             self.announced = ""
+
+    def slow_streams(self, readings, minimum, now):
+        """Slow streams worth an exit change. A stream still slow after one change is the
+        feed's problem: moving again would only interrupt everyone else."""
+        self.moved_for = {k: at for k, at in self.moved_for.items() if now - at < FEED_MEMORY_SECONDS}
+        suspects = exit_suspects(readings, minimum)
+        chosen = [r for r in suspects if r["name"] not in self.moved_for]
+        names = {r["name"] for r in chosen}
+        feeds = {
+            r["name"]: r for r in readings
+            if r["speed"] is not None and r["speed"] < minimum and r["name"] not in names
+        }
+        for name in set(feeds) - self.feeds_noted:
+            self.store.log("feed_slow", stream=name, speed=round(feeds[name]["speed"], 2),
+                           detail="not moving: the exit does not look like the cause")
+        self.feeds_noted = set(feeds)
+        return chosen
+
+    def drop_streams(self, now):
+        try:
+            self.store.log("dropped_live", streams=drop_live(self.current_accounts(now)))
+        except Exception:
+            logger.exception("Gluetun AutoSwitch: dropping live streams failed")
 
     def speed_health(self, settings, now, watching):
         """Polite causes from the scheduled test, which only runs when nobody is watching:
@@ -1269,14 +1341,19 @@ class Service:
             self.probe_at = now
             self.speed_streak, self.speed_cause = 0, []
             self.speed_due = now + SPEED_SETTLE_SECONDS
-            stop_event.wait(20)
+            self.moved_for.update({name: now for name in self.slow_now})
+            stop_event.wait(DROP_AFTER_SECONDS)
+            self.drop_streams(now)
+            stop_event.wait(20 - DROP_AFTER_SECONDS)
             arrived = exit_info()
             self.store.log("exit", **arrived)
             if arrived.get("ip") and arrived.get("ip") == left.get("ip"):
                 # Gluetun picks at random, so it can land on the same server again.
                 self.store.log("not_moved", detail="the exit address did not change")
                 switch_exit(settings, self.store, cause="same address, trying once more", left=left)
-                stop_event.wait(20)
+                stop_event.wait(DROP_AFTER_SECONDS)
+                self.drop_streams(now)
+                stop_event.wait(20 - DROP_AFTER_SECONDS)
                 self.store.log("exit", **exit_info())
 
     def announce(self, key, event, **details):
@@ -1341,7 +1418,7 @@ def _saved_settings():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.6.0"
+    version = "1.6.1"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property
@@ -1394,6 +1471,7 @@ class Plugin:
                 now_at = exit_info()
                 if now_at.get("ip") and now_at["ip"] != before:
                     store.log("exit", **now_at)
+                    store.log("dropped_live", streams=drop_live(load_accounts()))
                     return {"status": "ok", "message": f"Moved to {now_at.get('city')} ({now_at['ip']})."}
             if now_at.get("ip"):
                 store.log("not_moved", detail="the exit address did not change")

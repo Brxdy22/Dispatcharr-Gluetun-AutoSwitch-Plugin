@@ -12,7 +12,7 @@ Tested on Dispatcharr 0.33.0.
 
 Copy this repository's files into `/data/plugins/gluetun_autoswitch` in your Dispatcharr data folder, then enable **Gluetun AutoSwitch** on the Plugins page.
 
-Or download `gluetun_autoswitch-1.6.0.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
+Or download `gluetun_autoswitch-1.6.1.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
 
 ## Use
 
@@ -25,6 +25,7 @@ Or download `gluetun_autoswitch-1.6.0.zip` from Releases and import it on the Pl
 
 - Exit checks and the relay list use Mullvad's public endpoints, so it is built for Mullvad.
 - VOD rejection detection reads the attempts logged by [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin).
+- After a switch it asks [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover) 1.1.0 or later to close dead live connections, so streams reconnect sooner. Without it, streams wait for Dispatcharr's read timeout.
 - Run the tests with `python3 -m unittest test_plugin`.
 
 ## Release notes
