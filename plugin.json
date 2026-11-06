@@ -1,6 +1,6 @@
 {
   "name": "Gluetun AutoSwitch",
-  "version": "1.8",
+  "version": "1.9",
   "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums. Exits a provider refused are kept off for 30 days.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -186,6 +186,14 @@
       "type": "string",
       "default": "http://127.0.0.1:8000",
       "help_text": "Gluetun's control server as Dispatcharr sees it."
+    },
+    {
+      "id": "gluetun_api_key",
+      "label": "Gluetun API key",
+      "type": "string",
+      "input_type": "password",
+      "default": "",
+      "help_text": "The key of a role in Gluetun's auth config that lists GET and PUT /v1/vpn/settings. Leave empty only if Gluetun's control server needs no key."
     },
     {
       "id": "speedtest",

@@ -1,7 +1,9 @@
+import http.server
 import unittest
 import json
 import os
 import tempfile
+import threading
 from plugin import (BACKLOG_BYTES, DEFAULTS, LiveTracker, LogTail, RejectionTracker, VodTracker,
                     backlog_from_proc, held_back, last_pcr, next_exit, parse_codes, parse_exits,
                     parse_rejection, plan_move)
@@ -230,7 +232,7 @@ class RuleSwitches(unittest.TestCase):
         moves = []
 
         class FakeGluetun:
-            def __init__(self, url):
+            def __init__(self, url, api_key=""):
                 pass
             def selection(self):
                 return tuple(list(part) for part in held)
@@ -491,7 +493,7 @@ class Routing(unittest.TestCase):
         self.assertEqual(P.route(["slow"], ["refused"], True), ("act", ["slow", "refused"]))
 
 class Forbidden(unittest.TestCase):
-    URL = "http://127.0.0.1:8090/live/user/pass/102119.ts"
+    URL = "http://127.0.0.1:8090/live/user/pass/1001.ts"
     def test_proxied_403(self):
         self.assertEqual(P.refused_urls([f"ERROR live_proxy.http_streamer HTTP 403 from {self.URL}"]), [self.URL])
     def test_repeats_collapse(self):
@@ -502,7 +504,7 @@ class Forbidden(unittest.TestCase):
                  f"Stream process error for channel {c}: boom HTTP Error 403 Forbidden"]
         self.assertEqual(P.refused_urls(lines), [self.URL])
     def test_feed_hides_credentials(self):
-        self.assertEqual(P.feed_of(self.URL), "102119.ts")
+        self.assertEqual(P.feed_of(self.URL), "1001.ts")
 
 class FakeStatus:
     def __init__(self, answers):
@@ -519,7 +521,7 @@ class Watchers(unittest.TestCase):
         self.s = P.Service({"data_dir": self.dir.name, "settings": {}})
         self.s.accounts, self.s.accounts_at = self.ACC, 1e12
         self.real, self.proxy = P.fetch_status, P.read_proxy_status
-        P.read_proxy_status = lambda base: {"preferred": "real.example:826 (1.2.3.4)", "upstreams": ["real.example:826"]}
+        P.read_proxy_status = lambda base: {"preferred": "real.example:8880 (1.2.3.4)", "upstreams": ["real.example:8880"]}
     def tearDown(self):
         P.fetch_status, P.read_proxy_status = self.real, self.proxy
         self.dir.cleanup()
@@ -590,7 +592,7 @@ class Watchers(unittest.TestCase):
     def test_recheck_goes_around_the_proxy(self):
         f = self.use(lambda u: (403, b"Forbidden"))
         self.s.check_blocked([f"HTTP 403 from {self.URL}"], 1000)
-        self.assertEqual(f.calls, ["http://real.example:826/live/user/pass/1.ts"])
+        self.assertEqual(f.calls, ["http://real.example:8880/live/user/pass/1.ts"])
     def test_never_through_the_proxy_when_the_upstream_is_unknown(self):
         P.read_proxy_status = lambda base: None
         f = self.use(lambda u: (403, b"Website Access Blocked"))
@@ -611,8 +613,8 @@ class Watchers(unittest.TestCase):
 class Direct(unittest.TestCase):
     URL = "http://127.0.0.1:8090/live/u/p/9.ts"
     def test_uses_the_preferred_upstream_without_its_ip(self):
-        self.assertEqual(P.direct_url(self.URL, {"preferred": "a.tv:826 (1.2.3.4)", "upstreams": ["b.tv"]}),
-                         "http://a.tv:826/live/u/p/9.ts")
+        self.assertEqual(P.direct_url(self.URL, {"preferred": "a.tv:8880 (1.2.3.4)", "upstreams": ["b.tv"]}),
+                         "http://a.tv:8880/live/u/p/9.ts")
     def test_falls_back_to_the_first_upstream(self):
         self.assertEqual(P.direct_url(self.URL, {"preferred": None, "upstreams": ["b.tv"]}), "http://b.tv/live/u/p/9.ts")
     def test_nothing_known(self):
@@ -652,8 +654,8 @@ class Speed(unittest.TestCase):
     def test_cloudflare_size_limit_is_respected(self):
         self.assertLess(P.SPEED_DOWN_BYTES, 100_000_000)
     def test_proxied_account_pings_the_real_provider(self):
-        status = {"preferred": "provider.example:826 (203.0.113.10)", "upstreams": ["x"]}
-        self.assertEqual(P.provider_target("http://127.0.0.1:8090", status), ("provider.example", 826))
+        status = {"preferred": "provider.example:8880 (203.0.113.10)", "upstreams": ["x"]}
+        self.assertEqual(P.provider_target("http://127.0.0.1:8090", status), ("provider.example", 8880))
     def test_default_port(self):
         self.assertEqual(P.provider_target("http://127.0.0.1:8091", {"upstreams": ["a.tv"]}), ("a.tv", 80))
     def test_direct_account(self):
@@ -702,7 +704,7 @@ class MovieLength(unittest.TestCase):
     def test_real_stored_length_needs_no_provider_call(self):
         self.assertEqual(P.movie_seconds(5400, self.never), (5400, "stored"))
     def test_stored_minutes_are_read_as_minutes(self):
-        self.assertEqual(P.movie_seconds(198, self.never), (11880, "stored"))  # Avatar: Fire and Ash
+        self.assertEqual(P.movie_seconds(198, self.never), (11880, "stored"))  # a long film
         self.assertEqual(P.movie_seconds(140, self.never), (8400, "stored"))   # #Clout
     def test_no_stored_length_asks_the_provider(self):
         self.assertEqual(P.movie_seconds(None, lambda: 6120), (6120, "provider"))
@@ -746,7 +748,7 @@ class LengthBySize(unittest.TestCase):
         self.assertEqual(P.clean_seconds(5400, 4 * self.GB), 5400)
     def test_a_short_real_looking_movie_still_goes_to_the_provider(self):
         self.assertEqual(P.movie_seconds(300, lambda: 6000, 300_000_000), (6000, "provider"))
-    def test_avatar_with_its_size(self):
+    def test_long_film_with_its_size(self):
         self.assertEqual(P.movie_seconds(198, lambda: 1 / 0, 4 * self.GB), (11880, "stored"))
 
 class Judge(unittest.TestCase):
@@ -1174,8 +1176,8 @@ class ExitOptions(unittest.TestCase):
 class FakeGluetun:
     selected = ([], [], [])
     moves = []
-    def __init__(self, url):
-        pass
+    def __init__(self, url, api_key=""):
+        FakeGluetun.key = api_key
     def selection(self):
         return FakeGluetun.selected
     def move_to(self, *args):
@@ -1194,6 +1196,9 @@ class SwitchByServer(unittest.TestCase):
         P.Gluetun, P.read_server_rows = self.saved
         P.random.choice = self.choice
         self.dir.cleanup()
+    def test_switch_passes_the_saved_key(self):
+        P.switch_exit({**self.settings, "gluetun_api_key": "secret-key"}, self.store, cause="x")
+        self.assertEqual(FakeGluetun.key, "secret-key")
     def test_without_blocks_nothing_changes(self):
         P.switch_exit(self.settings, self.store, cause="x")
         self.assertEqual(FakeGluetun.moves, [(["usa"], [])])  # the case flip forces a reconnect
@@ -1440,6 +1445,64 @@ class Listener(unittest.TestCase):
                 s.listener.shutdown()
                 s.listener.server_close()
                 P.BLOCK_PORT = saved
+
+
+class GluetunKey(unittest.TestCase):
+    """A real local server, so the header is checked as it goes over the wire."""
+    def serve(self, code=200, body=b"{}"):
+        seen = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def answer(self):
+                seen.append((self.command, self.path, self.headers.get("X-API-Key")))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(code)
+                self.end_headers()
+                self.wfile.write(body)
+            do_GET = do_PUT = answer
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}", seen
+
+    def test_key_goes_in_the_header(self):
+        url, seen = self.serve()
+        P.Gluetun(url, " secret-key ").settings()
+        self.assertEqual(seen, [("GET", "/v1/vpn/settings", "secret-key")])
+
+    def test_no_key_sends_no_header(self):
+        for key in ("", "   ", None):
+            url, seen = self.serve()
+            P.Gluetun(url, key).settings()
+            self.assertEqual(seen, [("GET", "/v1/vpn/settings", None)])
+
+    def test_put_carries_the_key_too(self):
+        body = json.dumps({"provider": {"server_selection": {}}}).encode()
+        url, seen = self.serve(body=body)
+        P.Gluetun(url, "secret-key").move_to(["USA"], [])
+        self.assertEqual([(m, k) for m, _, k in seen], [("GET", "secret-key"), ("PUT", "secret-key")])
+
+    def test_refusal_says_what_to_fix_and_hides_the_key(self):
+        for code in (401, 403):
+            url, _ = self.serve(code, b"secret-key echoed")
+            with self.assertRaises(RuntimeError) as caught:
+                P.Gluetun(url, "secret-key").settings()
+            self.assertIn("Gluetun API key", str(caught.exception))
+            self.assertNotIn("secret-key", str(caught.exception))
+
+    def test_other_errors_keep_gluetuns_detail(self):
+        url, _ = self.serve(400, b"bad city")
+        with self.assertRaisesRegex(RuntimeError, "400: bad city"):
+            P.Gluetun(url).settings()
+
+    def test_field_is_masked_and_default_empty(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json"), encoding="utf-8") as handle:
+            field = next(f for f in json.load(handle)["fields"] if f["id"] == "gluetun_api_key")
+        self.assertEqual(field["input_type"], "password")
+        self.assertEqual(field["default"], "")
+        self.assertEqual(DEFAULTS["gluetun_api_key"], "")
 
 
 if __name__ == "__main__":

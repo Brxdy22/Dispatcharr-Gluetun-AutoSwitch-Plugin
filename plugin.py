@@ -102,6 +102,7 @@ DEFAULTS = {
     "max_ping": 150,
     "provider_ping_factor": 2,
     "gluetun_url": "http://127.0.0.1:8000",
+    "gluetun_api_key": "",
 }
 TICK_SECONDS = 10
 BACKLOG_BYTES = 256 * 1024
@@ -580,21 +581,31 @@ def _text(value):
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
 
 
+AUTH_HELP = ("check the Gluetun API key, and that its role in Gluetun's auth config "
+             "lists GET and PUT /v1/vpn/settings")
+
+
 class Gluetun:
-    def __init__(self, base_url):
+    def __init__(self, base_url, api_key=""):
         self.base_url = str(base_url).rstrip("/")
+        self.api_key = str(api_key or "").strip()
 
     def _request(self, method, body=None):
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
         request = urllib.request.Request(
             f"{self.base_url}/v1/vpn/settings",
             method=method,
             data=None if body is None else json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 return response.read()
         except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                raise RuntimeError(f"Gluetun answered {error.code}: {AUTH_HELP}") from None
             detail = error.read(300).decode("utf-8", "replace")
             raise RuntimeError(f"Gluetun answered {error.code}: {detail}") from None
 
@@ -1195,7 +1206,7 @@ class Store:
 
 def switch_exit(settings, store, cause, left=None):
     """Move to the next allowed exit. Returns the city, or None if nothing moved."""
-    gluetun = Gluetun(settings["gluetun_url"])
+    gluetun = Gluetun(settings["gluetun_url"], settings.get("gluetun_api_key"))
     countries, cities, hostnames = gluetun.selection()
     servers = read_server_rows()
     allowed_countries, allowed_cities, blocked_countries, blocked_cities = exit_rules(settings, servers)
@@ -2030,7 +2041,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.8"
+    version = "1.9"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property
@@ -2047,7 +2058,7 @@ class Plugin:
         store = Store(context["data_dir"])
         if action == "status":
             status = store.status()
-            countries, cities, hostnames = Gluetun(settings["gluetun_url"]).selection()
+            countries, cities, hostnames = Gluetun(settings["gluetun_url"], settings.get("gluetun_api_key")).selection()
             entries, version = store.blocked()
             age = time.time() - float(status.get("at") or 0)
             return {
