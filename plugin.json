@@ -1,6 +1,6 @@
 {
   "name": "Gluetun AutoSwitch",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -16,30 +16,62 @@
     {
       "id": "exit_countries",
       "label": "Allowed countries",
-      "type": "string",
-      "default": "USA",
-      "help_text": "Gluetun country names, comma-separated, for example USA, Canada. Capitals are optional. Only used when Allowed cities is empty: each switch then asks for a random server, moving to the next country if several are listed."
+      "type": "multiselect",
+      "default": [
+        "USA"
+      ],
+      "help_text": "Countries set in Gluetun's SERVER_COUNTRIES. Only used when Allowed cities is empty: each switch then asks for a random server, moving to the next country if you pick several. After changing this, Save and press Reload Plugin at the top of this page to update the city lists.",
+      "options": [],
+      "placeholder": "Choose countries"
     },
     {
       "id": "exits",
       "label": "Allowed cities",
-      "type": "string",
-      "default": "Ashburn VA, Washington DC, New York NY, Secaucus NJ, Boston MA, Raleigh NC, Atlanta GA, Detroit MI, Chicago IL, Miami FL, Kansas City MO, Houston TX, Dallas TX, McAllen TX, Denver CO, Salt Lake City UT, Phoenix AZ, Seattle WA, Los Angeles CA, San Jose CA, San Francisco CA",
-      "help_text": "Gluetun city names, comma-separated, tried in this order. Capitals are optional. These take priority over Allowed countries. Leave empty to use countries alone."
+      "type": "multiselect",
+      "default": [
+        "Ashburn VA",
+        "Washington DC",
+        "New York NY",
+        "Secaucus NJ",
+        "Boston MA",
+        "Raleigh NC",
+        "Atlanta GA",
+        "Detroit MI",
+        "Chicago IL",
+        "Miami FL",
+        "Kansas City MO",
+        "Houston TX",
+        "Dallas TX",
+        "McAllen TX",
+        "Denver CO",
+        "Salt Lake City UT",
+        "Phoenix AZ",
+        "Seattle WA",
+        "Los Angeles CA",
+        "San Jose CA",
+        "San Francisco CA"
+      ],
+      "help_text": "Cities in your Allowed countries, tried in the order you pick them. These take priority over Allowed countries. Leave empty to use countries alone.",
+      "options": [],
+      "placeholder": "Choose cities"
     },
     {
       "id": "blocked_countries",
       "label": "Blocked countries",
-      "type": "string",
-      "default": "",
-      "help_text": "Optional. Countries never to move to, comma-separated. Capitals are optional."
+      "type": "multiselect",
+      "default": [],
+      "help_text": "Optional. Countries never to move to.",
+      "options": [],
+      "placeholder": "None"
     },
     {
       "id": "blocked_cities",
       "label": "Blocked cities",
-      "type": "string",
-      "default": "",
-      "help_text": "Optional. Cities never to move to, comma-separated. Capitals are optional. With countries only, the plugin picks the city itself so a blocked one can't come up."
+      "type": "multiselect",
+      "default": [],
+      "help_text": "Optional. Cities never to move to. With countries only, the plugin picks the city itself so a blocked one can't come up.",
+      "options": [],
+      "placeholder": "None"
     },
     {
       "id": "min_speed",
@@ -86,9 +118,21 @@
     {
       "id": "reject_codes",
       "label": "Rejection codes",
-      "type": "string",
-      "default": "403, 520-527",
-      "help_text": "HTTP answers that mean the exit address was refused. Leave out 404 (title missing) and 458, 460 or 429 (connection limit): a new exit fixes none of those."
+      "type": "multiselect",
+      "default": [
+        "403",
+        "520",
+        "521",
+        "522",
+        "523",
+        "524",
+        "525",
+        "526",
+        "527"
+      ],
+      "help_text": "HTTP answers that mean the exit address was refused. 404 (title missing) and 458, 460 or 429 (connection limit) aren't offered: a new exit fixes none of those.",
+      "options": [],
+      "placeholder": "Choose codes"
     },
     {
       "id": "probe_minutes",

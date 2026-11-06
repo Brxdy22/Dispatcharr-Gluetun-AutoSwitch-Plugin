@@ -738,5 +738,74 @@ class Repair(unittest.TestCase):
         self.assertIsNone(self.s.repairs)
         self.assertIn("repair_gave_up", "".join(self.s.store.recent(5)))
 
+class SelectionFields(unittest.TestCase):
+    SERVERS = {"USA": ["Ashburn VA", "Boston MA"], "Canada": ["Toronto"], "Sweden": ["Malmo"]}
+
+    def manifest(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json")
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)["fields"]
+
+    def build(self, enabled=("USA", "Canada"), settings=None, servers=None):
+        servers = self.SERVERS if servers is None else servers
+        fields = P.build_fields(self.manifest(), servers, list(enabled), settings or {})
+        return {f["id"]: [o["value"] for o in f.get("options") or []] for f in fields}
+
+    def test_countries_come_from_compose_only(self):
+        self.assertEqual(self.build(settings={"exit_countries": ["USA"]})["exit_countries"], ["USA", "Canada"])
+
+    def test_cities_follow_saved_countries(self):
+        fields = self.build(settings={"exit_countries": ["Canada"], "exits": []})
+        self.assertEqual(fields["exits"], ["Toronto"])
+        self.assertEqual(fields["blocked_cities"], ["Toronto"])
+
+    def test_no_countries_chosen_shows_every_enabled_city(self):
+        fields = self.build(settings={"exit_countries": [], "exits": []})
+        self.assertEqual(fields["exits"], ["Ashburn VA", "Boston MA", "Toronto"])
+
+    def test_country_case_follows_the_server_list(self):
+        self.assertEqual(self.build(["usa"], {"exit_countries": ["USA"]})["exit_countries"], ["USA"])
+
+    def test_saved_values_stay_offered(self):
+        fields = self.build(settings={"exit_countries": ["Sweden", "USA"], "exits": ["Gone City"], "blocked_cities": "Old, Older"})
+        self.assertIn("Sweden", fields["exit_countries"])
+        self.assertIn("Gone City", fields["exits"])
+        self.assertEqual(fields["blocked_cities"][-2:], ["Old", "Older"])
+
+    def test_every_default_is_offered_without_the_server_list(self):
+        fields = self.build((), {}, {})
+        for field in self.manifest():
+            if field["type"] == "multiselect":
+                self.assertTrue(set(field["default"]) <= set(fields[field["id"]]), field["id"])
+
+    def test_old_range_text_is_expanded(self):
+        codes = self.build(settings={"reject_codes": "403, 600-601"})["reject_codes"]
+        self.assertTrue({"403", "600", "601", "520"} <= set(codes))
+
+    def test_default_codes_match_the_old_text(self):
+        self.assertEqual(parse_codes(DEFAULTS["reject_codes"]), parse_codes("403, 520-527"))
+
+    def test_lists_and_text_parse_alike(self):
+        self.assertEqual(parse_exits(["Ashburn VA", " Boston MA "]), parse_exits("Ashburn VA, Boston MA"))
+        self.assertEqual(parse_exits([]), [])
+        self.assertEqual(parse_exits(""), [])
+
+    def test_enabled_countries(self):
+        self.assertEqual(P.enabled_countries("SERVER_COUNTRIES=USA, Canada"), ["USA", "Canada"])
+        self.assertEqual(P.enabled_countries("USA"), ["USA"])
+        self.assertEqual(P.enabled_countries(None), [])
+
+    def test_read_servers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "s.json")
+            with open(path, "w") as handle:
+                json.dump({"servers": [{"country": "USA", "city": "B"}, {"country": "USA", "city": "A"}, {"country": "USA"}]}, handle)
+            self.assertEqual(P.read_servers(path), {"USA": ["A", "B"]})
+            self.assertEqual(P.read_servers(path + "x"), {})
+            with open(path, "w") as handle:
+                handle.write("{bad")
+            self.assertEqual(P.read_servers(path), {})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,19 +43,50 @@ from collections import deque, namedtuple
 
 logger = logging.getLogger("plugins.gluetun_autoswitch")
 
+PLUGIN_KEY = "gluetun_autoswitch"
+# Gluetun's own server list, mounted read-only into Dispatcharr.
+SERVERS_FILE = "/gluetun-servers/mullvad.json"
+# Gluetun's SERVER_COUNTRIES, passed on to Dispatcharr. "USA" and "SERVER_COUNTRIES=USA"
+# both work, so compose can reuse Gluetun's own line. Don't share the compose file itself:
+# it holds the WireGuard key.
+COUNTRIES_ENV = "GLUETUN_SERVER_COUNTRIES"
+REJECT_CODE_OPTIONS = [401, 403, 451, 502, 504, *range(520, 528), 530]
+
 DEFAULTS = {
     "auto_switch": False,
-    "exits": "Ashburn VA, Washington DC, New York NY, Secaucus NJ, Boston MA, Raleigh NC, Atlanta GA, Detroit MI, Chicago IL, Miami FL, Kansas City MO, Houston TX, Dallas TX, McAllen TX, Denver CO, Salt Lake City UT, Phoenix AZ, Seattle WA, Los Angeles CA, San Jose CA, San Francisco CA",
-    "exit_countries": "USA",
-    "blocked_countries": "",
-    "blocked_cities": "",
+    "exits": [
+        "Ashburn VA",
+        "Washington DC",
+        "New York NY",
+        "Secaucus NJ",
+        "Boston MA",
+        "Raleigh NC",
+        "Atlanta GA",
+        "Detroit MI",
+        "Chicago IL",
+        "Miami FL",
+        "Kansas City MO",
+        "Houston TX",
+        "Dallas TX",
+        "McAllen TX",
+        "Denver CO",
+        "Salt Lake City UT",
+        "Phoenix AZ",
+        "Seattle WA",
+        "Los Angeles CA",
+        "San Jose CA",
+        "San Francisco CA",
+    ],
+    "exit_countries": ["USA"],
+    "blocked_countries": [],
+    "blocked_cities": [],
     "min_speed": 0.9,
     "window_seconds": 90,
     "cooldown_minutes": 5,
     "max_switches_per_hour": 3,
     "reject_retries": 3,
     "reject_window_minutes": 15,
-    "reject_codes": "403, 520-527",
+    "reject_codes": ["403", "520", "521", "522", "523", "524", "525", "526", "527"],
     "probe_minutes": 5,
     "probe_refusals": 2,
     "speedtest_minutes": 60,
@@ -197,10 +228,15 @@ class VodTracker:
         return (last - first) / (last_wall - first_wall) / required
 
 
+def _items(value):
+    """The entries of a multi-select list, or of comma-separated text."""
+    return value if isinstance(value, (list, tuple)) else str(value or "").split(",")
+
+
 def parse_codes(text):
-    """{403, 520, 521} from '403, 520-521'."""
+    """{403, 520, 521} from '403, 520-521' or ['403', '520', '521']."""
     codes = set()
-    for part in str(text or "").split(","):
+    for part in _items(text):
         match = re.fullmatch(r"\s*(\d{3})(?:\s*-\s*(\d{3}))?\s*", part)
         if match:
             codes.update(range(int(match[1]), int(match[2] or match[1]) + 1))
@@ -420,7 +456,7 @@ class LogTail:
 
 
 def parse_exits(text):
-    return [city.strip().lower() for city in str(text or "").split(",") if city.strip()]
+    return [str(city).strip().lower() for city in _items(text) if str(city).strip()]
 
 
 def next_exit(current, exits):
@@ -1249,10 +1285,77 @@ class Service:
             self.store.log(event, **details)
 
 
+def read_servers(path=SERVERS_FILE):
+    """{country: [cities]} from Gluetun's server list, or {} when it can't be read."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            servers = json.load(handle)["servers"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    found = {}
+    for server in servers:
+        if server.get("country") and server.get("city"):
+            found.setdefault(server["country"], set()).add(server["city"])
+    return {country: sorted(cities) for country, cities in found.items()}
+
+
+def enabled_countries(text):
+    """Country names from SERVER_COUNTRIES, with or without its 'SERVER_COUNTRIES=' prefix."""
+    return [c.strip() for c in str(text or "").split("=")[-1].split(",") if c.strip()]
+
+
+def _options(values, saved):
+    """Options for a list. Saved values stay offered even when they've left the list, as
+    Dispatcharr refuses to save a multi-select holding a value it doesn't offer."""
+    return [{"value": v, "label": v} for v in dict.fromkeys([*values, *saved])]
+
+
+def build_fields(fields, servers, enabled, settings):
+    """Fields with their lists filled. Cities follow the saved Allowed countries."""
+    fields = json.loads(json.dumps(fields))
+    saved = lambda field: settings.get(field["id"], field.get("default"))  # noqa: E731
+    names = lambda field: [str(v).strip() for v in _items(saved(field)) if str(v).strip()]  # noqa: E731
+    by_name = {country.lower(): country for country in servers}
+    countries = [by_name.get(c.lower(), c) for c in enabled] or sorted(servers)
+    allowed = next(f for f in fields if f["id"] == "exit_countries")
+    chosen = {c.lower() for c in names(allowed)}
+    shown = [c for c in countries if c.lower() in chosen] or countries
+    cities = sorted({city for country in shown for city in servers.get(country, [])})
+    for field in fields:
+        if field["id"] in ("exit_countries", "blocked_countries"):
+            field["options"] = _options(countries, names(field))
+        elif field["id"] in ("exits", "blocked_cities"):
+            field["options"] = _options(cities, names(field))
+        elif field["id"] == "reject_codes":
+            codes = sorted(parse_codes(saved(field)) | set(REJECT_CODE_OPTIONS))
+            field["options"] = _options([str(code) for code in codes], [])
+    return fields
+
+
+def _saved_settings():
+    from apps.plugins.models import PluginConfig
+
+    config = PluginConfig.objects.filter(key=PLUGIN_KEY).first()
+    return (config.settings if config else None) or {}
+
+
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.5.0"
+    version = "1.6.0"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
+
+    @property
+    def fields(self):
+        """Read when the plugin loads, so Reload Plugin updates the lists."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json")
+        with open(path, encoding="utf-8") as handle:
+            fields = json.load(handle)["fields"]
+        try:
+            settings = _saved_settings()
+        except Exception:
+            logger.exception("Could not read the saved settings for the country and city lists")
+            settings = {}
+        return build_fields(fields, read_servers(), enabled_countries(os.environ.get(COUNTRIES_ENV)), settings)
 
     def on_leader_acquired(self, context):
         service = Service(context)
