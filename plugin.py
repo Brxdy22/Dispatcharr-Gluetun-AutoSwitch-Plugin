@@ -48,10 +48,10 @@ logger = logging.getLogger("plugins.gluetun_autoswitch")
 PLUGIN_KEY = "gluetun_autoswitch"
 # Gluetun's own server list, mounted read-only into Dispatcharr.
 SERVERS_FILE = "/gluetun-servers/mullvad.json"
-# Gluetun's SERVER_COUNTRIES, passed on to Dispatcharr. "USA" and "SERVER_COUNTRIES=USA"
-# both work, so compose can reuse Gluetun's own line. Don't share the compose file itself:
-# it holds the WireGuard key.
-COUNTRIES_ENV = "GLUETUN_SERVER_COUNTRIES"
+# Dispatcharr's web workers keep the plugin's lists from load time; see refresh_lists.
+LIST_LISTENER = "gluetun_autoswitch_lists"
+SAVE_ORIGINAL = "_gluetun_autoswitch_update_settings"
+LIST_PATHS = ("/api/plugins/plugins/", "/api/plugins/plugins/gluetun_autoswitch/settings/")
 REJECT_CODE_OPTIONS = [401, 403, 451, 502, 504, *range(520, 528), 530]
 
 DEFAULTS = {
@@ -160,12 +160,13 @@ REJECTION_LINE = re.compile(
 # Everything in Gluetun's namespace shares 127.0.0.1, so only those containers reach it.
 BLOCK_HOST = "127.0.0.1"
 BLOCK_PORT = 9733
+OPEN_LISTENERS = []
 BLOCK_PATH = "/vod-blocked"
 BLOCK_DAYS = 30
 BLOCKED_FIELD = "blocked_exits"
 BLOCKED_INFO_FIELD = "blocked_exits_info"
 LIST_VERSION = re.compile(r"List version (\d+)")
-EXIT_WATCH_SECONDS = 60  # how often the current exit is compared with the blocked list
+EXIT_WATCH_SECONDS = 60  # how often the current exit is compared with the rules
 EXIT_CACHE_SECONDS = 60  # an exit read this recently is trusted for a block
 RECENT_MOVE_SECONDS = 30  # a request this soon after a move rides on it instead of moving again
 VOD_CHECK_FIRST_SECONDS = 120  # the first background check after a start
@@ -994,6 +995,34 @@ def plan_server(servers, here, countries, cities, blocked_countries=(), blocked_
     return None
 
 
+def exit_rules(settings, rows):
+    """(countries, cities, blocked countries, blocked cities) in force. A city only counts
+    while its country is allowed, so with no country no city is read, and with nowhere
+    allowed the exit stays where it is rather than risking the tunnel."""
+    countries, cities = parse_exits(settings["exit_countries"]), parse_exits(settings["exits"])
+    places = {}
+    for row in rows:
+        places.setdefault(row["city"].lower(), set()).add(row["country"].lower())
+    cities = [
+        city for city in cities if countries and (city not in places or places[city] & set(countries))
+    ]
+    return countries, cities, parse_exits(settings["blocked_countries"]), parse_exits(settings["blocked_cities"])
+
+
+def rule_problem(row, countries, cities, blocked_countries, blocked_cities):
+    """Why a server breaks the rules, or '' when it is fine."""
+    country, city = row["country"].lower(), row["city"].lower()
+    if country in blocked_countries:
+        return f"{row['country']} is blocked"
+    if city in blocked_cities:
+        return f"{row['city']} is blocked"
+    if cities:
+        return "" if city in cities else f"{row['city']} is not in Allowed cities"
+    if countries and country not in countries:
+        return f"{row['country']} is not in Allowed countries"
+    return ""
+
+
 def active_blocks(entries, now):
     """Blocked exits that have not expired yet, keyed by server name."""
     return {host: entry for host, entry in (entries or {}).items() if float(entry.get("expires") or 0) > now}
@@ -1168,15 +1197,12 @@ def switch_exit(settings, store, cause, left=None):
     """Move to the next allowed exit. Returns the city, or None if nothing moved."""
     gluetun = Gluetun(settings["gluetun_url"])
     countries, cities, hostnames = gluetun.selection()
-    allowed_countries = parse_exits(settings["exit_countries"])
-    allowed_cities = parse_exits(settings["exits"])
-    blocked_countries = parse_exits(settings["blocked_countries"])
-    blocked_cities = parse_exits(settings["blocked_cities"])
+    servers = read_server_rows()
+    allowed_countries, allowed_cities, blocked_countries, blocked_cities = exit_rules(settings, servers)
     blocked_hosts = set(active_blocks(store.blocked()[0], time.time()))
     if blocked_hosts or hostnames:
         # Only a named server can avoid a blocked one. Once Gluetun holds a name, later
         # moves name one too, so the old name can't linger beside a city or country.
-        servers = read_server_rows()
         if not servers:
             store.log("no_exit", detail="could not read Gluetun's server list to avoid blocked exits")
             return None
@@ -1284,6 +1310,7 @@ class Service:
         if self.listener:
             self.listener.shutdown()
             self.listener.server_close()
+            OPEN_LISTENERS.remove(self.listener)
             self.listener = None
         self.store.log("stopped")
 
@@ -1297,6 +1324,7 @@ class Service:
         except OSError as error:
             logger.warning("Gluetun AutoSwitch: port %s not available yet: %s", BLOCK_PORT, error)
             return
+        OPEN_LISTENERS.append(server)
         server.daemon_threads = True
         threading.Thread(target=server.serve_forever, name="gluetun_autoswitch_listener", daemon=True).start()
         self.listener = server
@@ -1335,18 +1363,24 @@ class Service:
             publish_blocked(hosts, text)
         return kept
 
-    def watch_exit(self, blocked, now):
-        """Urgent causes when the exit is on the blocked list, as after Gluetun restarts
-        and picks its own random server."""
-        if not blocked or now - self.exit_seen_at < EXIT_WATCH_SECONDS:
+    def watch_exit(self, blocked, now, settings=None):
+        """Urgent causes when the exit is on the blocked list or breaks the allowed and
+        blocked places, as after Gluetun restarts and picks from its own compose setting."""
+        if now - self.exit_seen_at < EXIT_WATCH_SECONDS:
+            return []
+        rows = read_server_rows() if settings else []
+        rules = exit_rules(settings, rows) if rows else None
+        if not blocked and not (rules and any(rules)):
             return []
         here = self.current_exit(now, max_age=0)
         entry = blocked.get(here.get("hostname")) or next(
             (e for e in blocked.values() if here.get("ip") and e.get("ip") == here.get("ip")), None,
         )
-        if not entry:
-            return []
-        return [f"exit {here.get('ip')} ({here.get('hostname')}) is blocked by {', '.join(entry.get('accounts') or [])}"]
+        if entry:
+            return [f"exit {here.get('ip')} ({here.get('hostname')}) is blocked by {', '.join(entry.get('accounts') or [])}"]
+        row = locate(here.get("hostname"), rows)
+        problem = rule_problem(row, *rules) if row and rules else ""
+        return [f"exit {here.get('hostname')}: {problem}"] if problem else []
 
     def vod_blocked(self, request):
         """m3u-failover found an account refusing VOD on this exit. Blocks the exit and moves,
@@ -1482,7 +1516,7 @@ class Service:
             for account, count in counts.items() if count >= retries
         ]
         blocked_exits = self.sync_blocked(settings, now)
-        urgent += self.watch_exit(blocked_exits, now)
+        urgent += self.watch_exit(blocked_exits, now, settings)
         polite = self.check_blocked(lines, now) + self.probe_accounts(settings, now)
         polite += self.speed_health(settings, now, bool(readings))
         self.vod_check(settings, now, bool(readings))
@@ -1778,6 +1812,19 @@ class Service:
             self.store.log(event, **details)
 
 
+def close_in_child():
+    """A worker forked while the port is open inherits it, keeps it after the service stops,
+    and leaves m3u-failover connecting to a socket nobody answers."""
+    for server in OPEN_LISTENERS:
+        try:
+            server.socket.close()
+        except OSError:
+            pass
+
+
+os.register_at_fork(after_in_child=close_in_child)
+
+
 def block_handler(service):
     """Requests from m3u-failover: POST /vod-blocked {"port", "account", "title", "budget"}."""
 
@@ -1830,15 +1877,21 @@ def read_servers(path=SERVERS_FILE):
     return {country: sorted(cities) for country, cities in found.items()}
 
 
-def enabled_countries(text):
-    """Country names from SERVER_COUNTRIES, with or without its 'SERVER_COUNTRIES=' prefix."""
-    return [c.strip() for c in str(text or "").split("=")[-1].split(",") if c.strip()]
-
-
 def _options(values, saved):
     """Options for a list. Saved values stay offered even when they've left the list, as
     Dispatcharr refuses to save a multi-select holding a value it doesn't offer."""
     return [{"value": v, "label": v} for v in dict.fromkeys([*values, *saved])]
+
+
+def city_options(servers, countries, saved):
+    """Cities by country, labelled with it. The value stays the bare city, as Gluetun names it."""
+    options = {}
+    for country in sorted(countries, key=str.lower):
+        for city in sorted(servers.get(country, [])):
+            options.setdefault(city, f"{city} ({country})")
+    for city in saved:
+        options.setdefault(city, city)
+    return [{"value": city, "label": label} for city, label in options.items()]
 
 
 def exit_options(rows, countries, entries, saved):
@@ -1862,22 +1915,22 @@ def exit_options(rows, countries, entries, saved):
     return options
 
 
-def build_fields(fields, servers, enabled, settings, rows=(), entries=None):
+def build_fields(fields, servers, settings, rows=(), entries=None):
     """Fields with their lists filled. Cities follow the saved Allowed countries."""
     fields = json.loads(json.dumps(fields))
     saved = lambda field: settings.get(field["id"], field.get("default"))  # noqa: E731
     names = lambda field: [str(v).strip() for v in _items(saved(field)) if str(v).strip()]  # noqa: E731
-    by_name = {country.lower(): country for country in servers}
-    countries = [by_name.get(c.lower(), c) for c in enabled] or sorted(servers)
+    countries = sorted(servers)
     allowed = next(f for f in fields if f["id"] == "exit_countries")
     chosen = {c.lower() for c in names(allowed)}
-    shown = [c for c in countries if c.lower() in chosen] or countries
-    cities = sorted({city for country in shown for city in servers.get(country, [])})
+    shown = [c for c in countries if c.lower() in chosen]
     for field in fields:
         if field["id"] in ("exit_countries", "blocked_countries"):
             field["options"] = _options(countries, names(field))
-        elif field["id"] in ("exits", "blocked_cities"):
-            field["options"] = _options(cities, names(field))
+        elif field["id"] == "exits":
+            field["options"] = city_options(servers, shown, names(field))
+        elif field["id"] == "blocked_cities":
+            field["options"] = city_options(servers, shown, names(field))
         elif field["id"] == BLOCKED_FIELD:
             field["options"] = exit_options(rows, shown, entries or {}, names(field))
         elif field["id"] == "reject_codes":
@@ -1893,31 +1946,96 @@ def _saved_settings():
     return (config.settings if config else None) or {}
 
 
+def current_fields():
+    """The fields with their lists filled from what is saved right now."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json")
+    with open(path, encoding="utf-8") as handle:
+        fields = json.load(handle)["fields"]
+    try:
+        settings = _saved_settings()
+    except Exception:
+        logger.exception("Could not read the saved settings for the country and city lists")
+        settings = {}
+    try:
+        entries = active_blocks(Store(DATA_DIR).blocked()[0], time.time())
+    except Exception:
+        logger.exception("Could not read the blocked exits")
+        entries = {}
+    return build_fields(
+        fields, read_servers(), settings, read_server_rows(), entries,
+    )
+
+
+def refill_options(loaded, fresh):
+    """Put the fresh lists into a loaded plugin's fields, leaving the rest of each field."""
+    options = {field["id"]: field["options"] for field in fresh if "options" in field}
+    for field in loaded:
+        if field.get("id") in options:
+            field["options"] = options[field["id"]]
+
+
+def refresh_lists(sender=None, environ=None, **_):
+    """Dispatcharr keeps a plugin's fields per web worker from when it loaded, so a saved
+    country would need Reload Plugin, which also disturbs the other workers' services.
+    Instead every worker refills its own lists when the page asks for them. A Save counts
+    too: Dispatcharr refuses a value its worker's list doesn't offer."""
+    if (environ or {}).get("PATH_INFO") not in LIST_PATHS:
+        return
+    try:
+        from apps.plugins.loader import PluginManager
+
+        loaded = PluginManager.get().get_plugin(PLUGIN_KEY)
+        if loaded and loaded.fields:
+            refill_options(loaded.fields, current_fields())
+    except Exception:
+        logger.exception("Could not refresh the country and city lists")
+
+
+def settings_problem(settings):
+    """Why these settings can't be saved, or ''. Page data leaves out fields never touched,
+    which keep their default, so only an emptied list counts."""
+    if "exit_countries" in settings and not parse_exits(settings["exit_countries"]):
+        return "Pick at least one Allowed country. Nothing was saved."
+    return ""
+
+
+def guard_saves():
+    """Dispatcharr has no required fields, so its save is wrapped; its API shows the error
+    on the page. Other plugins pass straight through. A reload wraps the original again."""
+    try:
+        from apps.plugins.loader import PluginManager
+    except ImportError:  # outside Dispatcharr, as in the tests
+        return
+    original = getattr(PluginManager, SAVE_ORIGINAL, None) or PluginManager.update_settings
+    setattr(PluginManager, SAVE_ORIGINAL, original)
+
+    def update_settings(self, key, settings):
+        problem = settings_problem(settings or {}) if key == PLUGIN_KEY else ""
+        if problem:
+            raise ValueError(problem)
+        return original(self, key, settings)
+
+    PluginManager.update_settings = update_settings
+
+
+def watch_requests():
+    """Listen for page requests. A plugin reload replaces the old module's listener."""
+    try:
+        from django.core.signals import request_started
+    except ImportError:  # outside Dispatcharr, as in the tests
+        return
+    request_started.disconnect(dispatch_uid=LIST_LISTENER)
+    request_started.connect(refresh_lists, weak=False, dispatch_uid=LIST_LISTENER)
+
+
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.7"
+    version = "1.8"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property
     def fields(self):
-        """Read when the plugin loads, so Reload Plugin updates the lists."""
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json")
-        with open(path, encoding="utf-8") as handle:
-            fields = json.load(handle)["fields"]
-        try:
-            settings = _saved_settings()
-        except Exception:
-            logger.exception("Could not read the saved settings for the country and city lists")
-            settings = {}
-        try:
-            entries = active_blocks(Store(DATA_DIR).blocked()[0], time.time())
-        except Exception:
-            logger.exception("Could not read the blocked exits")
-            entries = {}
-        return build_fields(
-            fields, read_servers(), enabled_countries(os.environ.get(COUNTRIES_ENV)), settings,
-            read_server_rows(), entries,
-        )
+        return current_fields()
 
     def on_leader_acquired(self, context):
         service = Service(context)
@@ -1985,3 +2103,7 @@ class Plugin:
             }
             return {"status": "ok", "message": "Asked every account. Nothing was moved.", "answers": answers}
         return {"status": "error", "message": f"Unknown action: {action}"}
+
+
+watch_requests()
+guard_saves()

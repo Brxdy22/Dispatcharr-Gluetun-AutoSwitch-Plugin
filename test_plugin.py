@@ -104,6 +104,182 @@ class Backlog(unittest.TestCase):
     def test_listening_ignored(self):
         self.assertEqual(backlog_from_proc(proc((PUBLIC, "0A", 0, 999999))), 0)
 
+class LiveLists(unittest.TestCase):
+    def fresh(self):
+        return [{"id": "exits", "options": [{"value": "Toronto", "label": "Toronto"}]},
+                {"id": "auto_switch"}]
+
+    def test_only_the_lists_change(self):
+        loaded = [{"id": "exits", "label": "Allowed cities", "options": []},
+                  {"id": "auto_switch", "default": True}]
+        P.refill_options(loaded, self.fresh())
+        self.assertEqual(loaded[0]["options"][0]["value"], "Toronto")
+        self.assertEqual(loaded[0]["label"], "Allowed cities")
+        self.assertEqual(loaded[1], {"id": "auto_switch", "default": True})
+
+    def test_other_requests_are_ignored(self):
+        original = P.current_fields
+        P.current_fields = lambda: self.fail("rebuilt the lists for an unrelated request")
+        try:
+            P.refresh_lists(environ={"PATH_INFO": "/api/channels/channels/"})
+            P.refresh_lists(environ={"PATH_INFO": "/api/plugins/plugins/other_plugin/settings/"})
+            P.refresh_lists()
+        finally:
+            P.current_fields = original
+
+    def test_a_failure_never_reaches_the_request(self):
+        P.refresh_lists(environ={"PATH_INFO": P.LIST_PATHS[0]})  # no Dispatcharr here
+
+    def test_cities_follow_the_saved_countries(self):
+        fields = [{"id": i} for i in ("exit_countries", "exits", "blocked_countries",
+                                      "blocked_cities", "blocked_exits")]
+        servers = {"Canada": ["Toronto"], "USA": ["Dallas TX"]}
+        built = P.build_fields(fields, servers, {"exit_countries": ["Canada"]})
+        cities = next(f for f in built if f["id"] == "exits")["options"]
+        self.assertEqual([o["value"] for o in cities], ["Toronto"])
+
+
+class Rules(unittest.TestCase):
+    ROWS = [{"hostname": "us-aaa-wg-001", "city": "Dallas TX", "country": "USA"},
+            {"hostname": "ca-aaa-wg-001", "city": "Toronto", "country": "Canada"},
+            {"hostname": "se-aaa-wg-001", "city": "Malmo", "country": "Sweden"}]
+
+    def rules(self, countries=(), cities=(), blocked_countries=(), blocked_cities=()):
+        return P.exit_rules({"exit_countries": list(countries), "exits": list(cities),
+                             "blocked_countries": list(blocked_countries),
+                             "blocked_cities": list(blocked_cities)}, self.ROWS)
+
+    def problem(self, index, *args, **kwargs):
+        return P.rule_problem(self.ROWS[index], *self.rules(*args, **kwargs))
+
+    def test_no_country_means_no_city_is_read(self):
+        self.assertEqual(self.rules(cities=["Toronto"])[:2], ([], []))
+
+    def test_city_of_a_removed_country_is_ignored(self):
+        self.assertEqual(self.rules(["USA"], ["Toronto", "Dallas TX"])[1], ["dallas tx"])
+
+    def test_only_leftover_cities_falls_back_to_the_countries(self):
+        self.assertEqual(self.rules(["USA"], ["Toronto"])[:2], (["usa"], []))
+
+    def test_city_not_in_the_list_is_kept(self):
+        self.assertEqual(self.rules(["USA"], ["Gone City"])[1], ["gone city"])
+
+    def test_fine_exit(self):
+        self.assertEqual(self.problem(0, ["USA"]), "")
+        self.assertEqual(self.problem(1, ["Canada"]), "")
+
+    def test_country_not_allowed(self):
+        self.assertIn("not in Allowed countries", self.problem(1, ["USA"]))
+
+    def test_city_not_allowed(self):
+        self.assertIn("not in Allowed cities", self.problem(0, ["USA"], ["Other City"]))
+        self.assertIn("not in Allowed cities", P.rule_problem(self.ROWS[0], ["usa"], ["toronto"], [], []))
+
+    def test_blocked_wins_over_allowed(self):
+        self.assertIn("is blocked", self.problem(0, ["USA"], blocked_countries=["USA"]))
+        self.assertIn("is blocked", self.problem(0, ["USA"], blocked_cities=["Dallas TX"]))
+        self.assertIn("is blocked", self.problem(1, ["Canada"], blocked_countries=["Canada"]))
+
+
+class SaveGuard(unittest.TestCase):
+    def test_emptied_countries_are_refused(self):
+        self.assertIn("at least one", P.settings_problem({"exit_countries": []}))
+        self.assertIn("at least one", P.settings_problem({"exit_countries": [" "], "exits": ["Toronto"]}))
+
+    def test_a_country_passes(self):
+        self.assertEqual(P.settings_problem({"exit_countries": ["USA"]}), "")
+
+    def test_untouched_countries_keep_their_default(self):
+        self.assertEqual(P.settings_problem({"auto_switch": True}), "")
+
+
+class ForkedListener(unittest.TestCase):
+    def test_a_forked_child_does_not_keep_the_port(self):
+        import http.server
+        import socket
+        import time
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+        port = server.server_address[1]
+        P.OPEN_LISTENERS.append(server)
+        ready, told = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.write(told, b"x")  # the fork hooks have run by now
+            time.sleep(3)
+            os._exit(0)
+        try:
+            os.read(ready, 1)
+            server.server_close()
+            P.OPEN_LISTENERS.remove(server)
+            again = socket.socket()
+            again.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            again.bind(("127.0.0.1", port))  # raises while the child still holds it
+            again.close()
+        finally:
+            os.kill(child, 9)
+            os.waitpid(child, 0)
+            os.close(ready)
+            os.close(told)
+
+
+class RuleSwitches(unittest.TestCase):
+    """switch_exit with the rules applied, against a stand-in for Gluetun."""
+    ROWS = Rules.ROWS
+
+    def move(self, held=((), (), ()), **settings):
+        moves = []
+
+        class FakeGluetun:
+            def __init__(self, url):
+                pass
+            def selection(self):
+                return tuple(list(part) for part in held)
+            def move_to(self, countries, cities, hostnames=None):
+                moves.append((countries, cities, hostnames))
+
+        class FakeStore:
+            def blocked(self):
+                return {}, 0
+            def log(self, *args, **kwargs):
+                pass
+            def add_switch(self, moment):
+                pass
+            def relays(self):
+                return {"at": 9e12, "relays": {"usa": ["dallas tx"], "canada": ["toronto"], "sweden": ["malmo"]}}
+
+        saved = P.Gluetun, P.read_server_rows
+        P.Gluetun, P.read_server_rows = FakeGluetun, lambda path=None: self.ROWS
+        try:
+            P.switch_exit({**DEFAULTS, "exits": [], **settings}, FakeStore(), cause="test")
+        finally:
+            P.Gluetun, P.read_server_rows = saved
+        return moves
+
+    def test_no_country_stays_put(self):
+        self.assertEqual(self.move(exit_countries=[]), [])
+        self.assertEqual(self.move(exit_countries=[], exits=["Toronto"]), [])
+
+    def test_a_named_server_with_no_country_stays_put(self):
+        self.assertEqual(self.move(held=([], [], ["us-aaa-wg-001"]), exit_countries=[]), [])
+
+    def test_a_blocked_country_is_avoided(self):
+        moves = self.move(held=([], [], ["us-aaa-wg-001"]), exit_countries=["USA", "Canada", "Sweden"],
+                          blocked_countries=["Canada"])
+        self.assertEqual(moves[0][2], ["se-aaa-wg-001"])
+
+    def test_a_blocked_city_is_avoided(self):
+        for _ in range(20):
+            moves = self.move(exit_countries=["USA", "Canada", "Sweden"], blocked_cities=["Toronto", "Malmo"])
+            self.assertEqual(moves[0][1], ["dallas tx"])
+
+    def test_leftover_city_is_never_used(self):
+        moves = self.move(exit_countries=["USA"], exits=["Toronto"])
+        self.assertEqual(moves[0][:2], (["usa"], []))
+
+    def test_everything_blocked_stays_put(self):
+        self.assertEqual(self.move(exit_countries=["USA"], blocked_countries=["USA"]), [])
+
+
 class Exits(unittest.TestCase):
     A = ["ashburn va", "new york ny", "chicago il"]
     def test_parse(self):
@@ -824,25 +1000,34 @@ class SelectionFields(unittest.TestCase):
         with open(path, encoding="utf-8") as handle:
             return json.load(handle)["fields"]
 
-    def build(self, enabled=("USA", "Canada"), settings=None, servers=None):
+    def build(self, settings=None, servers=None):
         servers = self.SERVERS if servers is None else servers
-        fields = P.build_fields(self.manifest(), servers, list(enabled), settings or {})
+        fields = P.build_fields(self.manifest(), servers, settings or {})
         return {f["id"]: [o["value"] for o in f.get("options") or []] for f in fields}
 
-    def test_countries_come_from_compose_only(self):
-        self.assertEqual(self.build(settings={"exit_countries": ["USA"]})["exit_countries"], ["USA", "Canada"])
+    def test_every_country_in_the_server_list_is_offered(self):
+        self.assertEqual(self.build(settings={"exit_countries": ["USA"]})["exit_countries"], sorted(self.SERVERS))
 
     def test_cities_follow_saved_countries(self):
         fields = self.build(settings={"exit_countries": ["Canada"], "exits": []})
         self.assertEqual(fields["exits"], ["Toronto"])
         self.assertEqual(fields["blocked_cities"], ["Toronto"])
 
-    def test_no_countries_chosen_shows_every_enabled_city(self):
+    def test_no_countries_chosen_shows_no_cities(self):
         fields = self.build(settings={"exit_countries": [], "exits": []})
-        self.assertEqual(fields["exits"], ["Ashburn VA", "Boston MA", "Toronto"])
+        self.assertEqual(fields["exits"], [])
+        self.assertEqual(fields["blocked_cities"], [])
+        self.assertEqual(fields["blocked_exits"], [])
 
-    def test_country_case_follows_the_server_list(self):
-        self.assertEqual(self.build(["usa"], {"exit_countries": ["USA"]})["exit_countries"], ["USA"])
+    def test_cities_are_labelled_and_sorted_by_country(self):
+        built = P.build_fields(self.manifest(), self.SERVERS, {"exit_countries": ["USA", "Canada"], "exits": ["Gone City"]})
+        cities = next(f for f in built if f["id"] == "exits")["options"]
+        self.assertEqual(cities, [
+            {"value": "Toronto", "label": "Toronto (Canada)"},
+            {"value": "Ashburn VA", "label": "Ashburn VA (USA)"},
+            {"value": "Boston MA", "label": "Boston MA (USA)"},
+            {"value": "Gone City", "label": "Gone City"},
+        ])
 
     def test_saved_values_stay_offered(self):
         fields = self.build(settings={"exit_countries": ["Sweden", "USA"], "exits": ["Gone City"], "blocked_cities": "Old, Older"})
@@ -851,7 +1036,7 @@ class SelectionFields(unittest.TestCase):
         self.assertEqual(fields["blocked_cities"][-2:], ["Old", "Older"])
 
     def test_every_default_is_offered_without_the_server_list(self):
-        fields = self.build((), {}, {})
+        fields = self.build({}, {})
         for field in self.manifest():
             if field["type"] == "multiselect":
                 self.assertTrue(set(field["default"]) <= set(fields[field["id"]]), field["id"])
@@ -867,11 +1052,6 @@ class SelectionFields(unittest.TestCase):
         self.assertEqual(parse_exits(["Ashburn VA", " Boston MA "]), parse_exits("Ashburn VA, Boston MA"))
         self.assertEqual(parse_exits([]), [])
         self.assertEqual(parse_exits(""), [])
-
-    def test_enabled_countries(self):
-        self.assertEqual(P.enabled_countries("SERVER_COUNTRIES=USA, Canada"), ["USA", "Canada"])
-        self.assertEqual(P.enabled_countries("USA"), ["USA"])
-        self.assertEqual(P.enabled_countries(None), [])
 
     def test_read_servers(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -987,7 +1167,7 @@ class ExitOptions(unittest.TestCase):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json")
         with open(path, encoding="utf-8") as handle:
             manifest = json.load(handle)["fields"]
-        fields = P.build_fields(manifest, {"USA": ["Ashburn VA"]}, ["USA"], {}, ROWS, {})
+        fields = P.build_fields(manifest, {"USA": ["Ashburn VA"]}, {}, ROWS, {})
         options = next(f for f in fields if f["id"] == "blocked_exits")["options"]
         self.assertEqual(len(options), 3)
 
@@ -1211,6 +1391,25 @@ class SyncBlocked(unittest.TestCase):
     def test_no_blocks_no_lookups(self):
         P.exit_info = lambda timeout=10: 1 / 0
         self.assertEqual(self.s.watch_exit({}, self.now), [])
+    def rule_watch(self, hostname, **settings):
+        rows = [{"hostname": "us-bbb-wg-001", "city": "Dallas TX", "country": "USA"},
+                {"hostname": "ca-aaa-wg-001", "city": "Toronto", "country": "Canada"}]
+        reader, P.read_server_rows = P.read_server_rows, lambda path=None: rows
+        P.exit_info = lambda timeout=10: {"ip": "203.0.113.1", "hostname": hostname}
+        try:
+            return self.s.watch_exit({}, self.now, {**DEFAULTS, "exits": [], **settings})
+        finally:
+            P.read_server_rows = reader
+    def test_watch_finds_an_exit_outside_the_allowed_countries(self):
+        causes = self.rule_watch("ca-aaa-wg-001", exit_countries=["USA"])
+        self.assertEqual(causes, ["exit ca-aaa-wg-001: Canada is not in Allowed countries"])
+    def test_watch_finds_a_blocked_city_with_no_blocked_exits(self):
+        causes = self.rule_watch("us-bbb-wg-001", exit_countries=["USA"], blocked_cities=["Dallas TX"])
+        self.assertEqual(causes, ["exit us-bbb-wg-001: Dallas TX is blocked"])
+    def test_watch_passes_an_allowed_exit(self):
+        self.assertEqual(self.rule_watch("us-bbb-wg-001", exit_countries=["USA"]), [])
+    def test_watch_leaves_an_unknown_server_alone(self):
+        self.assertEqual(self.rule_watch("xx-new-wg-001", exit_countries=["USA"]), [])
 
 BLOCKED, INFO = P.BLOCKED_FIELD, P.BLOCKED_INFO_FIELD
 

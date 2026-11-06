@@ -12,13 +12,13 @@ Tested on Dispatcharr 0.33.0.
 
 Copy this repository's files into `/data/plugins/gluetun_autoswitch` in your Dispatcharr data folder, then enable **Gluetun AutoSwitch** on the Plugins page.
 
-Or download `gluetun_autoswitch-1.7.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
+Or download `gluetun_autoswitch-1.8.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
 
 ## Use
 
 1. Dispatcharr must run through Gluetun, with Gluetun's control server reachable from Dispatcharr.
-2. To fill the country and city lists, mount Gluetun's `servers` folder read-only at `/gluetun-servers` in Dispatcharr, and set `GLUETUN_SERVER_COUNTRIES` in Dispatcharr to the same value as Gluetun's `SERVER_COUNTRIES`.
-3. Set the Gluetun URL and pick your allowed countries and cities in the plugin settings. After changing Allowed countries, save and press **Reload Plugin** to update the city lists.
+2. To fill the country and city lists, mount Gluetun's `servers` folder read-only at `/gluetun-servers` in Dispatcharr.
+3. Set the Gluetun URL and pick your allowed countries and cities in the plugin settings. At least one Allowed country is required. After changing Allowed countries, save and refresh the page to update the city and server lists.
 4. Use **Check status** to confirm it can reach Gluetun, then turn on Auto switch.
 
 Exits a provider refused are listed under **Blocked exits** for 30 days, with the account that refused them, and are never picked while listed. Untick one and save to allow it again.

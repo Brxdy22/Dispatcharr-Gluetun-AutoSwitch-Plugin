@@ -1,6 +1,6 @@
 {
   "name": "Gluetun AutoSwitch",
-  "version": "1.7",
+  "version": "1.8",
   "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums. Exits a provider refused are kept off for 30 days.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -20,7 +20,7 @@
       "default": [
         "USA"
       ],
-      "help_text": "Countries set in Gluetun's SERVER_COUNTRIES. Only used when Allowed cities is empty: each switch then asks for a random server, moving to the next country if you pick several. After changing this, Save and press Reload Plugin at the top of this page to update the city lists.",
+      "help_text": "Countries to use. Only used when Allowed cities is empty: each switch then asks for a random server, moving to the next country if you pick several. At least one is required: Save is refused without one. An exit that breaks these rules, as after a Gluetun restart, is moved within about a minute, even with someone watching. After changing this, Save and refresh the page to update the city and server lists.",
       "options": [],
       "placeholder": "Choose countries"
     },
@@ -51,7 +51,7 @@
         "San Jose CA",
         "San Francisco CA"
       ],
-      "help_text": "Cities in your Allowed countries, tried in the order you pick them. These take priority over Allowed countries. Leave empty to use countries alone.",
+      "help_text": "Cities in your Allowed countries, tried in the order you pick them. These take priority over Allowed countries. Pick a country first: a city is only read while its country is allowed. Leave empty to use countries alone.",
       "options": [],
       "placeholder": "Choose cities"
     },
