@@ -98,6 +98,7 @@ DEFAULTS = {
     "speedtest_minutes": 60,
     "speedtest_failures": 2,
     "min_download": 30,
+    "slow_percent": 40,
     "min_upload": 0,
     "max_ping": 150,
     "provider_ping_factor": 2,
@@ -131,6 +132,8 @@ SPEED_RETEST_SECONDS = 300  # a failed test is confirmed soon, not an hour later
 SPEED_SETTLE_SECONDS = 120  # a new exit gets its own test shortly after a switch
 BASELINE_TESTS = 20
 BASELINE_MINIMUM = 2
+MOVE_HOLD_SECONDS = 6  # m3u-failover keeps new requests waiting this long at most
+CLOSE_SETTLE_SECONDS = 0.5  # lets the close reach the provider before the tunnel goes
 FEED_MEMORY_SECONDS = 1800  # a stream gets one exit change per this long
 DROP_AFTER_SECONDS = 5  # time for the tunnel to come back before streams reconnect
 LOG_PATH = "/data/logs/dispatcharr.log"
@@ -800,6 +803,34 @@ def drop_live(accounts):
     return dropped
 
 
+def close_streams(accounts):
+    """Every stream through m3u-failover, closed while the old exit still works. A provider
+    that never sees a connection end keeps counting it, and with one connection allowed it
+    then refuses everything. An exit change cuts these streams either way."""
+    closed = 0
+    for url in {account.server_url.rstrip("/") for account in accounts}:
+        if urllib.parse.urlsplit(url).hostname not in LOCAL_HOSTS:
+            continue
+        try:
+            with urllib.request.urlopen(f"{url}/__before_move?hold={MOVE_HOLD_SECONDS}", timeout=2) as response:
+                closed += int(json.loads(response.read()).get("dropped") or 0)
+        except Exception as error:
+            logger.warning("Gluetun AutoSwitch: could not close streams at %s: %s", url, error)
+    return closed
+
+
+def close_before_move(store):
+    """Never stands in the way of the move itself."""
+    try:
+        closed = close_streams(load_accounts())
+    except Exception as error:
+        logger.warning("Gluetun AutoSwitch: closing streams before the move failed: %s", error)
+        return
+    if closed:
+        store.log("closed_streams", streams=closed)
+        time.sleep(CLOSE_SETTLE_SECONDS)
+
+
 def exit_suspects(readings, minimum):
     """Slow streams an exit could explain. Another stream of the same kind keeping up on the
     same tunnel means the exit is fine and that feed is the problem."""
@@ -846,7 +877,7 @@ def format_speed(result):
     return "\n".join(lines)
 
 
-def judge(result, settings, usual):
+def judge(result, settings, usual, usual_speed=None):
     """What in a speed test falls short. A failed measurement is no verdict, and a provider
     that can't be reached is its own problem: no exit fixes that."""
     problems = []
@@ -854,6 +885,10 @@ def judge(result, settings, usual):
         minimum, value = float(settings[limit]), result.get(key)
         if minimum > 0 and value is not None and value < minimum:
             problems.append(f"{name} {value:.0f} Mbps (minimum {minimum:.0f})")
+    percent, download = float(settings["slow_percent"]), result.get("download")
+    if percent > 0 and usual_speed and download is not None and not problems \
+            and download < usual_speed * percent / 100:
+        problems.append(f"download {download:.0f} Mbps (usually {usual_speed:.0f})")
     most, ping = float(settings["max_ping"]), result.get("ping")
     if most > 0 and ping is not None and ping > most:
         problems.append(f"ping {ping:.0f} ms (limit {most:.0f})")
@@ -898,6 +933,18 @@ def usual_pings(entries, hosts=None):
     return usual
 
 
+def usual_download(entries):
+    """Median download of recent tests with nobody watching, from journal entries oldest
+    first. Failed tests count too, so the usual follows reality and can't freeze high."""
+    values = [
+        entry["download"] for entry in entries
+        if entry.get("event") == "speed_test" and entry.get("download") is not None
+        and not entry.get("streams")
+    ]
+    recent = sorted(values[-BASELINE_TESTS:])
+    return recent[len(recent) // 2] if len(recent) >= BASELINE_MINIMUM else None
+
+
 def run_speed_test(store, accounts, settings):
     info = exit_info()
     pings, hosts = provider_pings(accounts)
@@ -912,7 +959,8 @@ def run_speed_test(store, accounts, settings):
         "provider_hosts": hosts,
         "streams": len(store.status().get("streams", [])),
     }
-    result["problems"] = judge(result, settings, usual_pings(store.entries(), hosts))
+    entries = store.entries()
+    result["problems"] = judge(result, settings, usual_pings(entries, hosts), usual_download(entries))
     result["unclear"] = result["download"] is None or result["ping"] is None
     result["text"] = format_speed(result)
     store.set_speed({"at": time.time(), "text": result["text"], "result": result})
@@ -1230,6 +1278,7 @@ def switch_exit(settings, store, cause, left=None):
             return None
         label = f"{server['city']} ({server['hostname']})"
         store.add_switch(time.time())
+        close_before_move(store)
         try:
             gluetun.move_to([], [], [server["hostname"]])
         except Exception as error:
@@ -1257,6 +1306,7 @@ def switch_exit(settings, store, cause, left=None):
         return None
     new_countries, new_cities, label = plan
     store.add_switch(time.time())  # a failed attempt still counts towards the limits
+    close_before_move(store)
     try:
         gluetun.move_to(new_countries, new_cities)
     except Exception as error:
@@ -2041,7 +2091,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.8.1.1"
+    version = "1.8.2"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property

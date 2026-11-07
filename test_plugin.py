@@ -1,4 +1,5 @@
 import http.server
+import io
 import unittest
 import json
 import os
@@ -779,6 +780,96 @@ class Judge(unittest.TestCase):
         base = {"when": "now"}
         self.assertIn("Health: good", P.format_speed({**base, "problems": []}))
         self.assertIn("Below minimum: a; b", P.format_speed({**base, "problems": ["a", "b"]}))
+
+class SlowExit(unittest.TestCase):
+    def test_far_below_usual_fails_above_the_minimum(self):
+        self.assertEqual(P.judge({**GOOD, "download": 56.0}, DEFAULTS, {}, 214.0),
+                         ["download 56 Mbps (usually 214)"])
+    def test_near_usual_passes(self):
+        self.assertEqual(P.judge({**GOOD, "download": 90.0}, DEFAULTS, {}, 214.0), [])
+    def test_below_the_minimum_is_reported_once(self):
+        self.assertEqual(P.judge({**GOOD, "download": 20.0}, DEFAULTS, {}, 214.0),
+                         ["download 20 Mbps (minimum 30)"])
+    def test_zero_turns_it_off(self):
+        self.assertEqual(P.judge({**GOOD, "download": 56.0}, {**DEFAULTS, "slow_percent": 0}, {}, 214.0), [])
+    def test_no_history_is_no_verdict(self):
+        self.assertEqual(P.judge({**GOOD, "download": 56.0}, DEFAULTS, {}, None), [])
+    def test_usual_is_the_median_and_failed_tests_count(self):
+        tests = [{"event": "speed_test", "download": d, "problems": ["x"]} for d in (100.0, 200.0, 300.0)]
+        self.assertEqual(P.usual_download(tests), 200.0)
+    def test_usual_skips_busy_failed_and_other_entries(self):
+        tests = [{"event": "speed_test", "download": 5.0, "streams": 2},
+                 {"event": "speed_test", "download": None}, {"event": "exit", "download": 1.0},
+                 {"event": "speed_test", "download": 200.0}]
+        self.assertIsNone(P.usual_download(tests))
+    def test_the_field_ships_with_the_default(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json")) as handle:
+            manifest = json.load(handle)
+        field = next(f for f in manifest["fields"] if f["id"] == "slow_percent")
+        self.assertEqual(field["default"], DEFAULTS["slow_percent"])
+        self.assertEqual(manifest["version"], P.Plugin.version)
+
+class CloseBeforeMove(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = P.Store(self.dir.name)
+        self.saved = P.Gluetun, P.read_server_rows, P.close_streams, P.load_accounts, P.time.sleep
+        P.Gluetun, P.read_server_rows = FakeGluetun, lambda: ROWS
+        P.load_accounts = lambda: []
+        P.time.sleep = lambda seconds: None
+        self.choice, P.random.choice = P.random.choice, FIRST
+        FakeGluetun.selected, FakeGluetun.moves = (["USA"], [], []), []
+        self.settings = {**DEFAULTS, "exits": [], "exit_countries": ["USA"]}
+        self.moves_at_close = []
+        def close(accounts):
+            self.moves_at_close.append(len(FakeGluetun.moves))
+            return 1
+        P.close_streams = close
+    def tearDown(self):
+        P.Gluetun, P.read_server_rows, P.close_streams, P.load_accounts, P.time.sleep = self.saved
+        P.random.choice = self.choice
+        self.dir.cleanup()
+    def events(self):
+        return [entry.get("event") for entry in self.store.entries()]
+    def test_streams_close_before_a_country_move(self):
+        P.switch_exit(self.settings, self.store, cause="x")
+        self.assertEqual(self.moves_at_close, [0])
+        self.assertEqual(len(FakeGluetun.moves), 1)
+        self.assertIn("closed_streams", self.events())
+    def test_streams_close_before_a_named_server_move(self):
+        FakeGluetun.selected = ([], [], ["us-aaa-wg-001"])
+        P.switch_exit(self.settings, self.store, cause="x", left=HERE)
+        self.assertEqual(self.moves_at_close, [0])
+        self.assertEqual(len(FakeGluetun.moves), 1)
+    def test_a_failed_close_never_stops_the_move(self):
+        def broken(accounts):
+            raise OSError("no")
+        P.close_streams = broken
+        self.assertTrue(P.switch_exit(self.settings, self.store, cause="x"))
+        self.assertEqual(len(FakeGluetun.moves), 1)
+    def test_nothing_closes_when_there_is_nowhere_to_go(self):
+        self.store.set_blocked({}, 1)
+        saved, P.plan_move = P.plan_move, lambda *a: None
+        try:
+            self.assertIsNone(P.switch_exit(self.settings, self.store, cause="x"))
+        finally:
+            P.plan_move = saved
+        self.assertEqual(self.moves_at_close, [])
+    def test_only_local_proxies_are_asked(self):
+        asked, saved = [], P.urllib.request.urlopen
+        class Reply(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def fake(url, timeout=None):
+            asked.append(url)
+            return Reply(b'{"dropped": 2}')
+        P.urllib.request.urlopen = fake
+        self.addCleanup(setattr, P.urllib.request, "urlopen", saved)
+        P.close_streams = self.saved[2]
+        accounts = [P.Account("a", "http://127.0.0.1:8091", "u", "p", "ua"),
+                    P.Account("b", "http://provider.example", "u", "p", "ua")]
+        self.assertEqual(P.close_streams(accounts), 2)
+        self.assertEqual(asked, ["http://127.0.0.1:8091/__before_move?hold=6"])
 
 class Usual(unittest.TestCase):
     def test_median_of_healthy_tests(self):

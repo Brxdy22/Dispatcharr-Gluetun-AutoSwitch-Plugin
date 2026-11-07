@@ -1,6 +1,6 @@
 {
   "name": "Gluetun AutoSwitch",
-  "version": "1.8.1.1",
+  "version": "1.8.2",
   "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums. Exits a provider refused are kept off for 30 days.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -234,6 +234,14 @@
       "type": "number",
       "default": 30,
       "help_text": "On one connection, like a stream. Your heaviest stream so far used about 10 Mbps. 0 turns this check off."
+    },
+    {
+      "section": "speedtest",
+      "id": "slow_percent",
+      "label": "Slow exit (% of usual download)",
+      "type": "number",
+      "default": 40,
+      "help_text": "A test below this share of your usual download counts as failed, even above the minimum. The usual is the median of recent tests. 0 turns this check off."
     },
     {
       "section": "speedtest",
