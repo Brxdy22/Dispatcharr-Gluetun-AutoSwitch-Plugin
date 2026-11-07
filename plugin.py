@@ -14,8 +14,8 @@ provider connection:
 Refusals are ported from Gluetun Rotate (MIT, PilaScat): a login check that costs no
 stream connection, and Cloudflare's block page behind a live 403. Unlike Rotate, local
 proxies count as the provider, because every account here sits behind one. These two
-wait for viewers to leave; slow streams and VOD rejections do not, as someone is
-already affected.
+wait for viewers to leave, and for VOD_END_GRACE_SECONDS after a VOD was last open;
+slow streams and VOD rejections do not, as someone is already affected.
 
 Rejections come from the attempts VOD Failover already logs, so no extra logins
 reach the provider. Only answers a new address can fix count: a 404 (title missing)
@@ -172,6 +172,7 @@ BLOCKED_INFO_FIELD = "blocked_exits_info"
 LIST_VERSION = re.compile(r"List version (\d+)")
 EXIT_WATCH_SECONDS = 60  # how often the current exit is compared with the rules
 EXIT_CACHE_SECONDS = 60  # an exit read this recently is trusted for a block
+VOD_END_GRACE_SECONDS = 180  # a player reconnects to seek and plays on from its buffer
 RECENT_MOVE_SECONDS = 30  # a request this soon after a move rides on it instead of moving again
 VOD_CHECK_FIRST_SECONDS = 120  # the first background check after a start
 DATA_DIR = os.path.join(
@@ -1348,6 +1349,7 @@ class Service:
         self.switch_lock = threading.Lock()  # the monitor and m3u-failover's requests take turns
         self.exit_seen, self.exit_seen_at = {}, 0.0
         self.moved_at = 0.0
+        self.vod_seen_at = 0.0
         self.listener = None
         self.stop_event = None
         self.vod_check_at = time.time() + VOD_CHECK_FIRST_SECONDS
@@ -1579,8 +1581,9 @@ class Service:
         blocked_exits = self.sync_blocked(settings, now)
         urgent += self.watch_exit(blocked_exits, now, settings)
         polite = self.check_blocked(lines, now) + self.probe_accounts(settings, now)
-        polite += self.speed_health(settings, now, bool(readings))
-        self.vod_check(settings, now, bool(readings))
+        watching = self.someone_watching(readings, now)
+        polite += self.speed_health(settings, now, watching)
+        self.vod_check(settings, now, watching)
         self.store.set_status({
             "at": now, "streams": readings, "rejections": counts,
             "login_refusal_rounds": self.refused_streak,
@@ -1591,13 +1594,21 @@ class Service:
             "last_vod_check": self.vod_check_last,
             "auto_switch": bool(settings["auto_switch"]),
         })
-        action, causes = route(urgent, polite, bool(readings))
+        action, causes = route(urgent, polite, watching)
         if action == "act":
             self.act(settings, causes, now, stop_event)
         elif action == "hold":
             self.announce("viewers", "held_back", reason="someone is watching", causes=causes)
         else:
             self.announced = ""
+
+    def someone_watching(self, readings, now):
+        """Open streams, or a VOD open moments ago. A VOD connection closes for a seek and
+        once the player has buffered ahead, while the viewer is still watching, and an exit
+        change then can cost the next request its provider slot."""
+        if any(r["kind"] == "vod" for r in readings):
+            self.vod_seen_at = now
+        return bool(readings) or now - self.vod_seen_at < VOD_END_GRACE_SECONDS
 
     def slow_streams(self, readings, minimum, now):
         """Slow streams worth an exit change. A stream still slow after one change is the
@@ -2091,7 +2102,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.8.2"
+    version = "1.8.2.1"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property

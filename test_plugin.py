@@ -1596,5 +1596,35 @@ class GluetunKey(unittest.TestCase):
         self.assertEqual(DEFAULTS["gluetun_api_key"], "")
 
 
+class VodEndGrace(unittest.TestCase):
+    def setUp(self):
+        self.s = P.Service.__new__(P.Service)
+        self.s.vod_seen_at = 0.0
+        self.vod = [{"kind": "vod", "name": "title"}]
+        self.live = [{"kind": "live", "name": "channel"}]
+
+    def test_nobody_has_watched(self):
+        self.assertFalse(self.s.someone_watching([], 1000))
+
+    def test_open_streams_count(self):
+        self.assertTrue(self.s.someone_watching(self.live, 1000))
+        self.assertTrue(self.s.someone_watching(self.vod, 1000))
+
+    def test_vod_counts_for_a_while_after_it_closes(self):
+        self.s.someone_watching(self.vod, 1000)
+        self.assertTrue(self.s.someone_watching([], 1000 + P.VOD_END_GRACE_SECONDS - 1))
+        self.assertFalse(self.s.someone_watching([], 1000 + P.VOD_END_GRACE_SECONDS))
+
+    def test_live_gets_no_grace(self):
+        self.s.someone_watching(self.live, 1000)
+        self.assertFalse(self.s.someone_watching([], 1001))
+
+    def test_polite_holds_and_urgent_still_acts_in_the_grace(self):
+        self.s.someone_watching(self.vod, 1000)
+        watching = self.s.someone_watching([], 1010)
+        self.assertEqual(P.route([], ["speed test failed"], watching)[0], "hold")
+        self.assertEqual(P.route(["title at 0.50x"], [], watching)[0], "act")
+
+
 if __name__ == "__main__":
     unittest.main()
