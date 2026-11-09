@@ -1024,6 +1024,19 @@ class PlaybackOnly(unittest.TestCase):
     def test_mild_slowness_never_counts(self):
         for at in range(1000, 1300, 10):
             self.assertEqual(self.s.slow_streams(self.live(0.87), 0.6, at, 30), [])
+    def test_hold_defaults_to_30_seconds(self):
+        self.assertEqual(P.fail_seconds(DEFAULTS), 30)
+    def test_hold_follows_the_box(self):
+        self.assertEqual(P.fail_seconds({"fail_seconds": "90"}), 90)
+    def test_broken_box_falls_back(self):
+        self.assertEqual(P.fail_seconds({"fail_seconds": ""}), 30)
+        self.assertEqual(P.fail_seconds({"fail_seconds": None}), 30)
+    def test_negative_is_no_hold(self):
+        self.assertEqual(P.fail_seconds({"fail_seconds": -5}), 0)
+    def test_a_longer_hold_waits_longer(self):
+        self.assertEqual(self.s.slow_streams(self.live(0.3), 0.6, 1000, 90), [])
+        self.assertEqual(self.s.slow_streams(self.live(0.3), 0.6, 1060, 90), [])
+        self.assertEqual(len(self.s.slow_streams(self.live(0.3), 0.6, 1090, 90)), 1)
     def test_no_hold_when_off(self):
         self.assertEqual(len(self.s.slow_streams(self.live(0.87), 0.9, 1000, 0)), 1)
     def test_background_vod_check_only_logs(self):

@@ -57,6 +57,7 @@ REJECT_CODE_OPTIONS = [401, 403, 451, 502, 504, *range(520, 528), 530]
 DEFAULTS = {
     "auto_switch": False,
     "playback_only": True,
+    "fail_seconds": 30,
     "exits": [
         "Ashburn VA",
         "Washington DC",
@@ -144,7 +145,6 @@ SEVERE_SHARE = 0.25  # a scheduled test under this share of the usual fails at o
 SLOW_BLOCK_HOURS = 6  # an exit proven slow is skipped this long, not 30 days: slowness passes
 SLOW_BLOCK_ACCOUNT = "slow speed"
 FAIL_SPEED = 0.6  # with playback_only, a stream must fall under this to count as failing
-FAIL_SECONDS = 30  # and stay under it this long, on top of the averaging window
 DROP_AFTER_SECONDS = 5  # time for the tunnel to come back before streams reconnect
 LOG_PATH = "/data/logs/dispatcharr.log"
 REFUSED_STATUSES = frozenset(range(520, 528))
@@ -446,6 +446,15 @@ def route(urgent, polite, watching):
     if polite:
         return ("hold" if watching else "act"), polite
     return "", []
+
+
+def fail_seconds(settings):
+    """How long a stream must stay under FAIL_SPEED, on top of the averaging window.
+    A blank or broken box falls back to the default instead of stopping the monitor."""
+    try:
+        return max(float(settings.get("fail_seconds")), 0.0)
+    except (TypeError, ValueError):
+        return float(DEFAULTS["fail_seconds"])
 
 
 def waits_for_playback(action, urgent, settings):
@@ -1673,7 +1682,7 @@ class Service:
         minimum, sustain = float(settings["min_speed"]), 0
         if settings["playback_only"]:
             # Mild slowness is usually the feed: only a stream that is really failing moves.
-            minimum, sustain = min(minimum, FAIL_SPEED), FAIL_SECONDS
+            minimum, sustain = min(minimum, FAIL_SPEED), fail_seconds(settings)
         self.check_tunnel(settings, now)
         self.sync_speed(settings)
         self.notice_moves(now)
@@ -2248,7 +2257,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.8.4"
+    version = "1.8.4.1"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property
