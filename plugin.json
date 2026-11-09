@@ -1,6 +1,6 @@
 {
   "name": "Gluetun AutoSwitch",
-  "version": "1.8.3",
+  "version": "1.9",
   "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums. Exits a provider refused are kept off for 30 days.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -12,6 +12,13 @@
       "type": "boolean",
       "default": false,
       "help_text": "Off = observe only: problems are logged as 'would switch'. On = really moves the VPN exit. A switch interrupts every stream on the tunnel for about 10 to 20 seconds."
+    },
+    {
+      "id": "playback_only",
+      "label": "Only switch when playback fails",
+      "type": "boolean",
+      "default": true,
+      "help_text": "On = the exit only moves when playback is really failing: a stream under 0.6x for 30 seconds, or a VOD refused on this exit. Speed tests, login refusals, block pages and the background VOD check are only logged as 'would switch', unless playback is failing too. Your exit rules and blocked exits still move at once. Off = any of these can move the exit, as before 1.9."
     },
     {
       "id": "exit_countries",
@@ -96,7 +103,7 @@
       "label": "Minimum speed (x real time)",
       "type": "number",
       "default": 0.9,
-      "help_text": "A stream counts as slow below this. 1.0 is exactly real time. It only moves the exit when no other stream of the same kind is keeping up, and once per stream every 30 minutes, because a stream still slow on a new exit is the feed's problem. The exception is a stream running at under half its old speed after a move: then the new exit is blocked for 6 hours and the exit moves again."
+      "help_text": "A stream counts as slow below this. 1.0 is exactly real time. With Only switch when playback fails on, 0.6 is used instead, held for 30 seconds. It only moves the exit when no other stream of the same kind is keeping up, and once per stream every 30 minutes, because a stream still slow on a new exit is the feed's problem. The exception is a stream running at under half its old speed after a move: then the new exit is blocked for 6 hours and the exit moves again."
     },
     {
       "id": "window_seconds",

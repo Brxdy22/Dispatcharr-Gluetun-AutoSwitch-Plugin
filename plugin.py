@@ -56,6 +56,7 @@ REJECT_CODE_OPTIONS = [401, 403, 451, 502, 504, *range(520, 528), 530]
 
 DEFAULTS = {
     "auto_switch": False,
+    "playback_only": True,
     "exits": [
         "Ashburn VA",
         "Washington DC",
@@ -142,6 +143,8 @@ EXIT_CHECK_DOWN_SECONDS = 5  # short, because it runs while people may be watchi
 SEVERE_SHARE = 0.25  # a scheduled test under this share of the usual fails at once
 SLOW_BLOCK_HOURS = 6  # an exit proven slow is skipped this long, not 30 days: slowness passes
 SLOW_BLOCK_ACCOUNT = "slow speed"
+FAIL_SPEED = 0.6  # with playback_only, a stream must fall under this to count as failing
+FAIL_SECONDS = 30  # and stay under it this long, on top of the averaging window
 DROP_AFTER_SECONDS = 5  # time for the tunnel to come back before streams reconnect
 LOG_PATH = "/data/logs/dispatcharr.log"
 REFUSED_STATUSES = frozenset(range(520, 528))
@@ -443,6 +446,13 @@ def route(urgent, polite, watching):
     if polite:
         return ("hold" if watching else "act"), polite
     return "", []
+
+
+def waits_for_playback(action, urgent, settings):
+    """Whether a move from polite causes alone must wait. Speed tests, login refusals and
+    block pages can be passing trouble, and a move can land somewhere worse, so with
+    playback_only they only move together with a playback failure."""
+    return action == "act" and not urgent and bool(settings["playback_only"])
 
 
 class RejectionTracker:
@@ -1377,6 +1387,7 @@ class Service:
         self.speed_cause = []
         self.slow_now = []
         self.worse_now = []
+        self.slow_since = {}  # stream name -> when it first read below the minimum
         self.moved_for = {}  # stream name -> (moved at, its speed before the move)
         self.move_seen = max(self.store.switches(), default=0.0)
         self.check_at = None
@@ -1490,6 +1501,11 @@ class Service:
         settings = self.settings()
         if not settings["vod_block_switch"] and not request.get("background"):
             return {"moved": False, "detail": "Switch at the first blocked VOD is off"}
+        if request.get("background") and settings["playback_only"]:
+            # Nobody is playing it: the next real request is refused and moves at once.
+            self.store.log("would_switch", causes=[f"{account} refused VOD in the background check"],
+                           detail="playback is not failing: Only switch when playback fails is on")
+            return {"moved": False, "detail": "Only switch when playback fails is on"}
         if not self.switch_lock.acquire(timeout=budget):
             return {"moved": False, "detail": "another switch is still running"}
         try:
@@ -1654,11 +1670,14 @@ class Service:
         now = time.time()
         readings = self.read_live(RedisClient.get_buffer(), now, window)
         readings += self.read_vod(RedisClient.get_client(), now, window)
-        minimum = float(settings["min_speed"])
+        minimum, sustain = float(settings["min_speed"]), 0
+        if settings["playback_only"]:
+            # Mild slowness is usually the feed: only a stream that is really failing moves.
+            minimum, sustain = min(minimum, FAIL_SPEED), FAIL_SECONDS
         self.check_tunnel(settings, now)
         self.sync_speed(settings)
         self.notice_moves(now)
-        slow = self.slow_streams(readings, minimum, now)
+        slow = self.slow_streams(readings, minimum, now, sustain)
         self.slow_now = [(r["name"], r["speed"]) for r in slow]
         urgent = [self.slow_cause(r) for r in slow]
         if self.worse_now and settings["auto_switch"]:
@@ -1691,6 +1710,10 @@ class Service:
             "auto_switch": bool(settings["auto_switch"]),
         })
         action, causes = route(urgent, polite, watching)
+        if waits_for_playback(action, urgent, settings):
+            action = ""
+            self.announce("playback_ok", "would_switch", causes=causes,
+                          detail="playback is not failing: Only switch when playback fails is on")
         if action == "act":
             # A proven slow exit can't wait out the cooldown: playback is already down.
             self.act(settings, causes, now, stop_event, cooldown=not checked)
@@ -1707,15 +1730,21 @@ class Service:
             self.vod_seen_at = now
         return bool(readings) or now - self.vod_seen_at < VOD_END_GRACE_SECONDS
 
-    def slow_streams(self, readings, minimum, now):
+    def slow_streams(self, readings, minimum, now, sustain=0):
         """Slow streams worth an exit change. A stream still slow after one change is the
         feed's problem: moving again would only interrupt everyone else. Unless the move
         made it clearly worse: then the new exit is the problem, not the feed."""
         self.moved_for = {k: v for k, v in self.moved_for.items() if now - v[0] < FEED_MEMORY_SECONDS}
         suspects = exit_suspects(readings, minimum)
+        below = {r["name"] for r in suspects}
+        self.slow_since = {k: at for k, at in self.slow_since.items() if k in below}
+        for name in below:
+            self.slow_since.setdefault(name, now)
+        waiting = {name for name in below if now - self.slow_since[name] < sustain}
+        suspects = [r for r in suspects if r["name"] not in waiting]
         self.worse_now = [r["name"] for r in suspects if self.worse_after_move(r, now)]
         chosen = [r for r in suspects if r["name"] not in self.moved_for or r["name"] in self.worse_now]
-        names = {r["name"] for r in chosen}
+        names = {r["name"] for r in chosen} | waiting
         feeds = {
             r["name"]: r for r in readings
             if r["speed"] is not None and r["speed"] < minimum and r["name"] not in names
@@ -2219,7 +2248,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.8.3"
+    version = "1.9"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property

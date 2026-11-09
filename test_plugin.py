@@ -992,6 +992,68 @@ class OneMovePerStream(unittest.TestCase):
         self.assertEqual(self.service.moved_for["a"][1], 0.87)
 
 
+class PlaybackOnly(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.s = P.Service({"data_dir": self.dir.name, "settings": {}})
+    def tearDown(self):
+        self.dir.cleanup()
+    def live(self, speed):
+        return [{"kind": "live", "name": "a", "speed": speed}]
+    def test_on_by_default(self):
+        self.assertTrue(DEFAULTS["playback_only"])
+    def test_polite_causes_alone_wait(self):
+        self.assertTrue(P.waits_for_playback("act", [], DEFAULTS))
+    def test_polite_causes_move_with_a_failing_stream(self):
+        self.assertFalse(P.waits_for_playback("act", ["a at 0.20x"], DEFAULTS))
+    def test_off_moves_as_before(self):
+        self.assertFalse(P.waits_for_playback("act", [], {**DEFAULTS, "playback_only": False}))
+    def test_nothing_to_do_is_nothing(self):
+        self.assertFalse(P.waits_for_playback("", [], DEFAULTS))
+    def test_failing_stream_waits_for_the_hold(self):
+        self.assertEqual(self.s.slow_streams(self.live(0.3), 0.6, 1000, 30), [])
+        self.assertEqual(self.s.slow_streams(self.live(0.3), 0.6, 1020, 30), [])
+        self.assertEqual(len(self.s.slow_streams(self.live(0.3), 0.6, 1030, 30)), 1)
+    def test_waiting_is_not_called_the_feed(self):
+        self.s.slow_streams(self.live(0.3), 0.6, 1000, 30)
+        self.assertFalse([e for e in self.s.store.entries() if e.get("event") == "feed_slow"])
+    def test_recovering_restarts_the_hold(self):
+        self.s.slow_streams(self.live(0.3), 0.6, 1000, 30)
+        self.s.slow_streams(self.live(0.9), 0.6, 1020, 30)
+        self.assertEqual(self.s.slow_streams(self.live(0.3), 0.6, 1035, 30), [])
+    def test_mild_slowness_never_counts(self):
+        for at in range(1000, 1300, 10):
+            self.assertEqual(self.s.slow_streams(self.live(0.87), 0.6, at, 30), [])
+    def test_no_hold_when_off(self):
+        self.assertEqual(len(self.s.slow_streams(self.live(0.87), 0.9, 1000, 0)), 1)
+    def test_background_vod_check_only_logs(self):
+        saved = P.switch_exit
+        moves = []
+        P.switch_exit = lambda *a, **k: moves.append(1) or "usa"
+        try:
+            s = P.Service({"data_dir": self.dir.name, "settings": {"auto_switch": True}})
+            s.accounts, s.accounts_at = [], 1e12
+            answer = s.vod_blocked({"port": 1, "budget": 0.5, "background": True})
+        finally:
+            P.switch_exit = saved
+        self.assertFalse(answer["moved"])
+        self.assertEqual(moves, [])
+        self.assertEqual(s.store.blocked()[0], {})
+        self.assertEqual(s.store.entries()[-1]["event"], "would_switch")
+    def test_a_real_vod_refusal_still_moves(self):
+        saved_switch, saved_exit = P.switch_exit, P.exit_info
+        moves = []
+        P.switch_exit = lambda *a, **k: moves.append(1) or "usa"
+        P.exit_info = lambda timeout=10: HERE
+        try:
+            s = P.Service({"data_dir": self.dir.name, "settings": {"auto_switch": True}})
+            s.accounts, s.accounts_at = [], 1e12
+            s.vod_blocked({"port": 1, "budget": 0.5})
+        finally:
+            P.switch_exit, P.exit_info = saved_switch, saved_exit
+        self.assertEqual(moves, [1])
+
+
 class Severe(unittest.TestCase):
     def test_far_under_the_usual(self):
         self.assertTrue(P.severe_download({"download": 34, "usual_download": 180}, DEFAULTS))
@@ -1597,7 +1659,7 @@ class VodCheck(unittest.TestCase):
         self.assertEqual(self.blocked, [])
         self.assertEqual(self.s.store.recent(5), [])
     def test_background_ignores_the_first_404_switch_setting(self):
-        self.settings = {"auto_switch": False, "vod_block_switch": False}
+        self.settings = {"auto_switch": False, "vod_block_switch": False, "playback_only": False}
         s = P.Service({"data_dir": self.dir.name, "get_settings": lambda: self.settings})
         s.accounts, s.accounts_at = [], 1e12
         self.assertEqual(s.vod_blocked({"port": 1, "budget": 0.5})["detail"], "Switch at the first blocked VOD is off")
