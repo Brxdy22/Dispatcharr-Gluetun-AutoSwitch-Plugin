@@ -10,6 +10,8 @@ Tested on Dispatcharr 0.33.0.
 
 Works with [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover) and [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin). All three together cover provider URL failover, account failover for VOD, and VPN exit switching.
 
+See [Dispatcharr Failover Stack](https://github.com/Brxdy22/Dispatcharr-Failover-Stack) to install all three side by side.
+
 ## Install
 
 Copy this repository's files into `/data/plugins/gluetun_autoswitch` in your Dispatcharr data folder, then enable **Gluetun AutoSwitch** on the Plugins page.
