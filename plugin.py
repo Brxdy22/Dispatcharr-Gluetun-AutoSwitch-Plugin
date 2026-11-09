@@ -2248,7 +2248,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.9"
+    version = "1.8.4"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property
