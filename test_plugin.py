@@ -954,15 +954,174 @@ class OneMovePerStream(unittest.TestCase):
         self.assertEqual(len(self.service.slow_streams(self.slow, 0.9, 1000)), 1)
 
     def test_still_slow_after_a_move_does_not(self):
-        self.service.moved_for["a"] = 1000
+        self.service.moved_for["a"] = (1000, 0.85)
         self.assertEqual(self.service.slow_streams(self.slow, 0.9, 1100), [])
         self.service.slow_streams(self.slow, 0.9, 1110)
         self.assertEqual(len(self.events()), 1)  # one journal line, not one per tick
 
     def test_forgotten_after_a_while(self):
-        self.service.moved_for["a"] = 1000
+        self.service.moved_for["a"] = (1000, 0.85)
         now = 1000 + P.FEED_MEMORY_SECONDS
         self.assertEqual(len(self.service.slow_streams(self.slow, 0.9, now)), 1)
+
+    def test_much_worse_after_a_move_blames_the_new_exit(self):
+        self.service.moved_for["a"] = (1000, 0.87)
+        worse = [{"kind": "live", "name": "a", "speed": 0.05}]
+        self.assertEqual(len(self.service.slow_streams(worse, 0.9, 1100)), 1)
+        self.assertEqual(self.service.worse_now, ["a"])
+        self.assertIn("0.87x before the move", self.service.slow_cause(worse[0]))
+
+    def test_worse_needs_a_minute_on_the_new_exit(self):
+        self.service.moved_for["a"] = (1000, 0.87)
+        worse = [{"kind": "live", "name": "a", "speed": 0.05}]
+        self.assertEqual(self.service.slow_streams(worse, 0.9, 1000 + P.WORSE_AFTER_SECONDS - 1), [])
+
+    def test_a_little_worse_is_still_the_feed(self):
+        self.service.moved_for["a"] = (1000, 0.8)
+        self.assertEqual(self.service.slow_streams([{"kind": "live", "name": "a", "speed": 0.5}], 0.9, 1100), [])
+
+    def test_a_healthy_stream_still_clears_the_exit(self):
+        self.service.moved_for["a"] = (1000, 0.87)
+        readings = [{"kind": "live", "name": "a", "speed": 0.05}, {"kind": "live", "name": "b", "speed": 1.0}]
+        self.assertEqual(self.service.slow_streams(readings, 0.9, 1100), [])
+        self.assertEqual(self.service.worse_now, [])
+
+    def test_a_move_remembers_the_speed_before(self):
+        self.service.slow_now = [("a", 0.87)]
+        self.service.after_move(1000)
+        self.assertEqual(self.service.moved_for["a"][1], 0.87)
+
+
+class Severe(unittest.TestCase):
+    def test_far_under_the_usual(self):
+        self.assertTrue(P.severe_download({"download": 34, "usual_download": 180}, DEFAULTS))
+    def test_under_half_the_minimum(self):
+        self.assertTrue(P.severe_download({"download": 14, "usual_download": None}, DEFAULTS))
+    def test_only_a_little_low(self):
+        self.assertFalse(P.severe_download({"download": 60, "usual_download": 180}, DEFAULTS))
+    def test_no_reading(self):
+        self.assertFalse(P.severe_download({"download": None, "usual_download": 180}, DEFAULTS))
+
+
+class ExitCheckProblem(unittest.TestCase):
+    def test_under_the_minimum(self):
+        self.assertIn("minimum 30", P.exit_check_problem(20, DEFAULTS, 180))
+    def test_under_the_slow_share(self):
+        self.assertIn("usually 180", P.exit_check_problem(34, DEFAULTS, 180))
+    def test_good(self):
+        self.assertEqual(P.exit_check_problem(150, DEFAULTS, 180), "")
+    def test_no_usual_yet(self):
+        self.assertEqual(P.exit_check_problem(40, DEFAULTS, None), "")
+    def test_failed_reading_is_no_verdict(self):
+        self.assertEqual(P.exit_check_problem(None, DEFAULTS, 180), "")
+
+
+class AddBlockKeepsLonger(unittest.TestCase):
+    def test_short_block_never_shortens_a_long_one(self):
+        here = {"hostname": "x-1", "ip": "1.1.1.1", "city": "X"}
+        entries = P.add_block({}, here, "Provider", 1000)
+        entries = P.add_block(entries, here, P.SLOW_BLOCK_ACCOUNT, 2000, days=P.SLOW_BLOCK_HOURS / 24)
+        self.assertEqual(entries["x-1"]["expires"], 1000 + P.BLOCK_DAYS * 86400)
+        self.assertEqual(entries["x-1"]["accounts"], ["Provider", P.SLOW_BLOCK_ACCOUNT])
+
+
+class ExitCheck(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.s = P.Service({"data_dir": self.dir.name, "settings": {}})
+        self.real = P.measure_download
+        self.speeds = []
+        P.measure_download = lambda seconds=None: self.speeds.pop(0)
+        self.s.current_exit = lambda now, max_age=0: {"ip": "9.9.9.9", "city": "Somewhere", "hostname": "us-x-1"}
+        for value in (180, 180, 180):
+            self.s.store.log("speed_test", download=value)
+        self.settings = {**DEFAULTS, "auto_switch": True}
+    def tearDown(self):
+        P.measure_download = self.real
+        self.dir.cleanup()
+    def moved(self, at):
+        self.s.store.add_switch(at)
+        self.s.notice_moves(at)
+    def test_any_move_schedules_a_check_and_drops_old_verdicts(self):
+        self.s.speed_cause, self.s.speed_streak = ["speed test failed"], 2
+        self.moved(1000)
+        self.assertEqual(self.s.check_at, 1000 + P.EXIT_CHECK_SECONDS)
+        self.assertEqual((self.s.speed_cause, self.s.speed_streak), ([], 0))
+    def test_waits_for_the_tunnel(self):
+        self.moved(1000)
+        self.assertEqual(self.s.exit_check(self.settings, 1010), [])
+        self.assertIsNotNone(self.s.check_at)
+    def test_slow_exit_is_a_cause_and_blocked_for_hours(self):
+        self.speeds = [20.0, 25.0]
+        self.moved(1000)
+        causes = self.s.exit_check(self.settings, 1030)
+        self.assertIn("too slow", causes[0])
+        entry = P.active_blocks(self.s.store.blocked()[0], 1030)["us-x-1"]
+        self.assertEqual(entry["accounts"], [P.SLOW_BLOCK_ACCOUNT])
+        self.assertAlmostEqual(entry["expires"], 1030 + P.SLOW_BLOCK_HOURS * 3600, delta=1)
+    def test_second_read_can_clear_it(self):
+        self.speeds = [20.0, 150.0]
+        self.moved(1000)
+        self.assertEqual(self.s.exit_check(self.settings, 1030), [])
+        self.assertEqual(self.s.store.blocked()[0], {})
+    def test_good_exit_reads_once(self):
+        self.speeds = [150.0, 1.0]
+        self.moved(1000)
+        self.assertEqual(self.s.exit_check(self.settings, 1030), [])
+        self.assertEqual(self.speeds, [1.0])
+    def test_runs_once_per_move(self):
+        self.speeds = [150.0]
+        self.moved(1000)
+        self.s.exit_check(self.settings, 1030)
+        self.assertEqual(self.s.exit_check(self.settings, 1040), [])
+    def test_observe_only_does_not_block(self):
+        self.speeds = [20.0, 20.0]
+        self.moved(1000)
+        self.assertTrue(self.s.exit_check({**self.settings, "auto_switch": False}, 1030))
+        self.assertEqual(self.s.store.blocked()[0], {})
+    def test_block_is_not_repeated(self):
+        here = {"hostname": "us-x-1", "ip": "9.9.9.9"}
+        self.s.block_slow(here, 1000, "slow")
+        version = self.s.store.blocked()[1]
+        self.s.block_slow(here, 1010, "slow")
+        self.assertEqual(self.s.store.blocked()[1], version)
+
+
+class MovedByHand(unittest.TestCase):
+    class Stop:
+        def wait(self, seconds=0):
+            return False
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.s = P.Service({"data_dir": self.dir.name, "settings": {}})
+        self.exit, self.switch = P.exit_info, P.switch_exit
+        self.moves = []
+        P.switch_exit = lambda *a, **k: self.moves.append(k.get("cause")) or "usa"
+        addresses = iter(["1.1.1.1"] + ["2.2.2.2"] * 5)
+        P.exit_info = lambda timeout=10: {"ip": next(addresses)}
+    def tearDown(self):
+        P.exit_info, P.switch_exit = self.exit, self.switch
+        self.dir.cleanup()
+    def test_a_move_during_the_tick_cancels_the_switch(self):
+        self.s.store.add_switch(1e9 - 1)  # the button, after this tick's notice_moves
+        self.s.act({**DEFAULTS, "auto_switch": True}, ["speed test failed"], 1e9, self.Stop())
+        self.assertEqual(self.moves, [])
+    def test_a_slow_new_exit_skips_the_cooldown(self):
+        self.s.store.add_switch(1e9 - 30)
+        self.s.notice_moves(1e9)
+        self.s.act({**DEFAULTS, "auto_switch": True}, ["new exit too slow"], 1e9, self.Stop(), cooldown=False)
+        self.assertEqual(len(self.moves), 1)
+    def test_but_not_the_hourly_limit(self):
+        for back in range(5):
+            self.s.store.add_switch(1e9 - 600 - back)
+        self.s.notice_moves(1e9)
+        self.s.act({**DEFAULTS, "auto_switch": True}, ["new exit too slow"], 1e9, self.Stop(), cooldown=False)
+        self.assertEqual(self.moves, [])
+    def test_normal_causes_keep_the_cooldown(self):
+        self.s.store.add_switch(1e9 - 30)
+        self.s.notice_moves(1e9)
+        self.s.act({**DEFAULTS, "auto_switch": True}, ["slow"], 1e9, self.Stop())
+        self.assertEqual(self.moves, [])
 
 
 class Schedule(unittest.TestCase):
@@ -1011,6 +1170,10 @@ class Schedule(unittest.TestCase):
         self.results = [self.bad(), self.bad()]
         self.s.speed_health(DEFAULTS, 1e9, False)
         self.assertIn("download 5 Mbps", self.s.speed_health(DEFAULTS, 1e9 + 301, False)[0])
+    def test_one_severe_failure_is_a_cause(self):
+        self.results = [{"unclear": False, "problems": ["download 34 Mbps (usually 180)"],
+                         "download": 34, "usual_download": 180}]
+        self.assertIn("34 Mbps", self.s.speed_health(DEFAULTS, 1e9, False)[0])
     def test_a_good_test_clears_it(self):
         self.results = [self.bad(), self.bad()]
         self.s.speed_health(DEFAULTS, 1e9, False)

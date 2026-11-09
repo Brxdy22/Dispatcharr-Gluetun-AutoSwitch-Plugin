@@ -135,6 +135,13 @@ BASELINE_MINIMUM = 2
 MOVE_HOLD_SECONDS = 6  # m3u-failover keeps new requests waiting this long at most
 CLOSE_SETTLE_SECONDS = 0.5  # lets the close reach the provider before the tunnel goes
 FEED_MEMORY_SECONDS = 1800  # a stream gets one exit change per this long
+WORSE_SHARE = 0.5  # unless it runs under half its speed from before the move: then the new exit is to blame
+WORSE_AFTER_SECONDS = 60  # a stream gets this long on the new exit before that comparison counts
+EXIT_CHECK_SECONDS = 25  # after any move, the new exit gets a quick test once the tunnel is back
+EXIT_CHECK_DOWN_SECONDS = 5  # short, because it runs while people may be watching
+SEVERE_SHARE = 0.25  # a scheduled test under this share of the usual fails at once
+SLOW_BLOCK_HOURS = 6  # an exit proven slow is skipped this long, not 30 days: slowness passes
+SLOW_BLOCK_ACCOUNT = "slow speed"
 DROP_AFTER_SECONDS = 5  # time for the tunnel to come back before streams reconnect
 LOG_PATH = "/data/logs/dispatcharr.log"
 REFUSED_STATUSES = frozenset(range(520, 528))
@@ -690,15 +697,15 @@ class RateMeter:
         return self.counted * 8 / (self.last - self.began) / 1_000_000
 
 
-def measure_download():
+def measure_download(seconds=SPEED_DOWN_SECONDS):
     """One connection on purpose: a stream gets one, so this is the speed it can reach."""
     url = f"https://{SPEED_HOST}/__down?bytes={SPEED_DOWN_BYTES}"
     request = urllib.request.Request(url, headers={"User-Agent": "gluetun-autoswitch"})
     meter = RateMeter()
     try:
-        while meter.elapsed() < SPEED_DOWN_SECONDS:
+        while meter.elapsed() < seconds:
             with urllib.request.urlopen(request, timeout=15) as response:
-                while meter.elapsed() < SPEED_DOWN_SECONDS:
+                while meter.elapsed() < seconds:
                     chunk = response.read(SPEED_CHUNK)
                     if not chunk:
                         break
@@ -961,12 +968,37 @@ def run_speed_test(store, accounts, settings):
         "streams": len(store.status().get("streams", [])),
     }
     entries = store.entries()
-    result["problems"] = judge(result, settings, usual_pings(entries, hosts), usual_download(entries))
+    result["usual_download"] = usual_download(entries)
+    result["problems"] = judge(result, settings, usual_pings(entries, hosts), result["usual_download"])
     result["unclear"] = result["download"] is None or result["ping"] is None
     result["text"] = format_speed(result)
     store.set_speed({"at": time.time(), "text": result["text"], "result": result})
     store.log("speed_test", **{k: v for k, v in result.items() if k not in ("when", "text")})
     return result
+
+
+def severe_download(result, settings):
+    """A download so far under the usual, or under half the minimum, that one test is
+    proof enough: waiting 5 minutes for a second one only keeps playback down."""
+    download, usual = result.get("download"), result.get("usual_download")
+    if download is None:
+        return False
+    minimum = float(settings["min_download"])
+    return bool((usual and download < usual * SEVERE_SHARE) or (minimum > 0 and download < minimum / 2))
+
+
+def exit_check_problem(download, settings, usual):
+    """Why a new exit's quick download test fails, or ''. Only the download limits count:
+    streams reconnecting at the same moment make ping and provider pings unreliable."""
+    if download is None:
+        return ""
+    minimum = float(settings["min_download"])
+    if minimum > 0 and download < minimum:
+        return f"download {download:.0f} Mbps (minimum {minimum:.0f})"
+    percent = float(settings["slow_percent"])
+    if percent > 0 and usual and download < usual * percent / 100:
+        return f"download {download:.0f} Mbps (usually {usual:.0f})"
+    return ""
 
 
 def publish_speed(text):
@@ -1090,7 +1122,7 @@ def active_blocks(entries, now):
 
 def add_block(entries, here, account, now, days=BLOCK_DAYS):
     """The entries with this exit blocked by the account. A repeat adds the account and
-    starts the days again."""
+    starts the days again, but never shortens a longer block already there."""
     key = here.get("hostname") or here.get("ip")
     entries = {host: dict(entry) for host, entry in (entries or {}).items()}
     entry = entries.get(key, {})
@@ -1101,7 +1133,7 @@ def add_block(entries, here, account, now, days=BLOCK_DAYS):
         "city": here.get("city") or entry.get("city"),
         "accounts": accounts,
         "at": now,
-        "expires": now + days * 86400,
+        "expires": max(float(entry.get("expires") or 0), now + days * 86400),
     }
     return entries
 
@@ -1344,7 +1376,10 @@ class Service:
         self.speed_streak = 0
         self.speed_cause = []
         self.slow_now = []
-        self.moved_for = {}
+        self.worse_now = []
+        self.moved_for = {}  # stream name -> (moved at, its speed before the move)
+        self.move_seen = max(self.store.switches(), default=0.0)
+        self.check_at = None
         self.feeds_noted = set()
         self.switch_lock = threading.Lock()  # the monitor and m3u-failover's requests take turns
         self.exit_seen, self.exit_seen_at = {}, 0.0
@@ -1556,7 +1591,61 @@ class Service:
         self.probe_at = now
         self.speed_streak, self.speed_cause = 0, []
         self.speed_due = now + SPEED_SETTLE_SECONDS
-        self.moved_for.update({name: now for name in self.slow_now})
+        self.moved_for.update({name: (now, speed) for name, speed in self.slow_now})
+
+    def notice_moves(self, now):
+        """Any move, by this monitor, a button or m3u-failover's request, gets the new exit
+        a quick test, and a speed-test verdict about the old exit no longer counts."""
+        latest = max(self.store.switches(), default=0.0)
+        if latest <= self.move_seen:
+            return
+        self.move_seen = latest
+        self.speed_streak, self.speed_cause = 0, []
+        self.check_at = latest + EXIT_CHECK_SECONDS
+
+    def exit_check(self, settings, now):
+        """Urgent causes from the quick test of a new exit. It runs even while people watch,
+        because a random pick can land on an exit too slow to play anything, and the
+        stream check alone would wait for streams to prove it. A second read confirms a
+        failure, since reconnecting streams share the tunnel for a moment."""
+        if self.check_at is None or now < self.check_at:
+            return []
+        self.check_at = None
+        if float(settings["min_download"]) <= 0 and float(settings["slow_percent"]) <= 0:
+            return []
+        here = self.current_exit(now, max_age=0)
+        if not here.get("ip"):
+            return []
+        usual = usual_download(self.store.entries())
+        speeds, problem = [], ""
+        for _ in range(2):
+            speed = measure_download(EXIT_CHECK_DOWN_SECONDS)
+            speeds.append(None if speed is None else round(speed, 1))
+            problem = exit_check_problem(speed, settings, usual)
+            if not problem:
+                break
+        self.store.log("exit_check", ip=here.get("ip"), city=here.get("city"), hostname=here.get("hostname"),
+                       download=speeds, usual=None if usual is None else round(usual), problem=problem or None)
+        if not problem:
+            return []
+        if settings["auto_switch"]:
+            self.block_slow(here, now, problem)
+        return [f"new exit {here.get('city') or here.get('ip')} too slow: {problem}"]
+
+    def block_slow(self, here, now, why):
+        """A few hours off the list for an exit proven slow, so the next random pick can't
+        land on it again tonight."""
+        key = here.get("hostname") or here.get("ip")
+        with self.store.blocked_lock:
+            entries, version = self.store.blocked()
+            if SLOW_BLOCK_ACCOUNT in (active_blocks(entries, now).get(key) or {}).get("accounts", []):
+                return  # already blocked for this; a held-back move would repeat it every tick
+            self.store.set_blocked(
+                add_block(active_blocks(entries, now), here, SLOW_BLOCK_ACCOUNT, now, days=SLOW_BLOCK_HOURS / 24),
+                version + 1,
+            )
+        self.store.log("blocked_exit", exits=[here.get("hostname") or here.get("ip")], ip=here.get("ip"),
+                       accounts=[SLOW_BLOCK_ACCOUNT], hours=SLOW_BLOCK_HOURS, detail=why)
 
     def tick(self, stop_event):
         from core.utils import RedisClient
@@ -1568,9 +1657,16 @@ class Service:
         minimum = float(settings["min_speed"])
         self.check_tunnel(settings, now)
         self.sync_speed(settings)
+        self.notice_moves(now)
         slow = self.slow_streams(readings, minimum, now)
-        self.slow_now = [r["name"] for r in slow]
-        urgent = [f"{r['name']} at {r['speed']:.2f}x" for r in slow]
+        self.slow_now = [(r["name"], r["speed"]) for r in slow]
+        urgent = [self.slow_cause(r) for r in slow]
+        if self.worse_now and settings["auto_switch"]:
+            here = self.current_exit(now)
+            if here.get("ip"):
+                self.block_slow(here, now, f"{', '.join(self.worse_now)} slower than before the move")
+        checked = self.exit_check(settings, now)
+        urgent += checked
         lines = self.log_tail.read()
         counts = self.read_rejections(settings, now, lines)
         retries = max(int(settings["reject_retries"]), 1)
@@ -1596,7 +1692,8 @@ class Service:
         })
         action, causes = route(urgent, polite, watching)
         if action == "act":
-            self.act(settings, causes, now, stop_event)
+            # A proven slow exit can't wait out the cooldown: playback is already down.
+            self.act(settings, causes, now, stop_event, cooldown=not checked)
         elif action == "hold":
             self.announce("viewers", "held_back", reason="someone is watching", causes=causes)
         else:
@@ -1612,10 +1709,12 @@ class Service:
 
     def slow_streams(self, readings, minimum, now):
         """Slow streams worth an exit change. A stream still slow after one change is the
-        feed's problem: moving again would only interrupt everyone else."""
-        self.moved_for = {k: at for k, at in self.moved_for.items() if now - at < FEED_MEMORY_SECONDS}
+        feed's problem: moving again would only interrupt everyone else. Unless the move
+        made it clearly worse: then the new exit is the problem, not the feed."""
+        self.moved_for = {k: v for k, v in self.moved_for.items() if now - v[0] < FEED_MEMORY_SECONDS}
         suspects = exit_suspects(readings, minimum)
-        chosen = [r for r in suspects if r["name"] not in self.moved_for]
+        self.worse_now = [r["name"] for r in suspects if self.worse_after_move(r, now)]
+        chosen = [r for r in suspects if r["name"] not in self.moved_for or r["name"] in self.worse_now]
         names = {r["name"] for r in chosen}
         feeds = {
             r["name"]: r for r in readings
@@ -1626,6 +1725,19 @@ class Service:
                            detail="not moving: the exit does not look like the cause")
         self.feeds_noted = set(feeds)
         return chosen
+
+    def worse_after_move(self, reading, now):
+        moved = self.moved_for.get(reading["name"])
+        if not moved:
+            return False
+        at, before = moved
+        return bool(before) and now - at >= WORSE_AFTER_SECONDS and reading["speed"] < before * WORSE_SHARE
+
+    def slow_cause(self, reading):
+        cause = f"{reading['name']} at {reading['speed']:.2f}x"
+        if reading["name"] in self.worse_now:
+            cause += f", {self.moved_for[reading['name']][1]:.2f}x before the move"
+        return cause
 
     def drop_streams(self, now):
         try:
@@ -1653,7 +1765,7 @@ class Service:
         elif result["problems"]:
             self.speed_streak += 1
             self.speed_due = now + SPEED_RETEST_SECONDS
-            if self.speed_streak >= max(int(settings["speedtest_failures"]), 1):
+            if severe_download(result, settings) or self.speed_streak >= max(int(settings["speedtest_failures"]), 1):
                 self.speed_cause = [f"speed test failed: {'; '.join(result['problems'])}"]
         else:
             self.speed_streak, self.speed_cause = 0, []
@@ -1839,18 +1951,23 @@ class Service:
         self.length_source[session] = source if duration > 0 else None
         return self.required[session]
 
-    def act(self, settings, causes, now, stop_event):
+    def act(self, settings, causes, now, stop_event, cooldown=True):
         if not self.switch_lock.acquire(blocking=False):
             return  # m3u-failover's request is moving the exit right now
         try:
-            self.act_locked(settings, causes, now, stop_event)
+            self.act_locked(settings, causes, now, stop_event, cooldown)
         finally:
             self.switch_lock.release()
 
-    def act_locked(self, settings, causes, now, stop_event):
+    def act_locked(self, settings, causes, now, stop_event, cooldown=True):
+        switches = self.store.switches()
+        if max(switches, default=0.0) > self.move_seen:
+            # Moved by hand while this tick measured: its causes were about the old exit.
+            self.store.log("held_back", reason="the exit changed while this was checked", causes=causes)
+            return
         reason = held_back(
-            self.store.switches(), now,
-            float(settings["cooldown_minutes"]) * 60, int(settings["max_switches_per_hour"]),
+            switches, now,
+            float(settings["cooldown_minutes"]) * 60 if cooldown else 0, int(settings["max_switches_per_hour"]),
         )
         if reason:
             self.announce(f"held:{reason}", "held_back", reason=reason, causes=causes)
@@ -2102,7 +2219,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.8.2.1"
+    version = "1.8.3"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property

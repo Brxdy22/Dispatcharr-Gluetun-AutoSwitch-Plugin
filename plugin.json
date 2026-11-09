@@ -1,6 +1,6 @@
 {
   "name": "Gluetun AutoSwitch",
-  "version": "1.8.2.1",
+  "version": "1.8.3",
   "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums. Exits a provider refused are kept off for 30 days.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -96,7 +96,7 @@
       "label": "Minimum speed (x real time)",
       "type": "number",
       "default": 0.9,
-      "help_text": "A stream counts as slow below this. 1.0 is exactly real time. It only moves the exit when no other stream of the same kind is keeping up, and once per stream every 30 minutes, because a stream still slow on a new exit is the feed's problem."
+      "help_text": "A stream counts as slow below this. 1.0 is exactly real time. It only moves the exit when no other stream of the same kind is keeping up, and once per stream every 30 minutes, because a stream still slow on a new exit is the feed's problem. The exception is a stream running at under half its old speed after a move: then the new exit is blocked for 6 hours and the exit moves again."
     },
     {
       "id": "window_seconds",
@@ -225,7 +225,7 @@
       "label": "Failed tests before switching",
       "type": "number",
       "default": 2,
-      "help_text": "Tests in a row below the minimums. A failed test is repeated after 5 minutes. The switch waits until nobody is watching."
+      "help_text": "Tests in a row below the minimums. A failed test is repeated after 5 minutes, unless the download is under a quarter of usual or half the minimum: then one test is enough. The switch waits until nobody is watching."
     },
     {
       "section": "speedtest",
@@ -241,7 +241,7 @@
       "label": "Slow exit (% of usual download)",
       "type": "number",
       "default": 40,
-      "help_text": "A test below this share of your usual download counts as failed, even above the minimum. The usual is the median of recent tests. 0 turns this check off."
+      "help_text": "A test below this share of your usual download counts as failed, even above the minimum. The usual is the median of recent tests. After every exit change, a 5-second download test checks the new exit against this and the minimum, even while you watch; a slow exit is blocked for 6 hours and left at once. 0 turns this check off."
     },
     {
       "section": "speedtest",
