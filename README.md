@@ -8,6 +8,8 @@ Moves [Gluetun](https://github.com/qdm12/gluetun) to another VPN exit when a str
 
 Tested on Dispatcharr 0.33.0.
 
+Works with [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover) and [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin). All three together cover provider URL failover, account failover for VOD, and VPN exit switching.
+
 ## Install
 
 Copy this repository's files into `/data/plugins/gluetun_autoswitch` in your Dispatcharr data folder, then enable **Gluetun AutoSwitch** on the Plugins page.
@@ -49,6 +51,13 @@ Keep this key private: `GET /v1/vpn/settings` returns your VPN private key. For 
 - Closing streams just before a switch needs [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover) 1.2.1 or later. Update it first, because older versions pass that request on to your provider.
 - Drag to reorder and search in the Allowed countries and cities lists come from [Clean Titles](https://github.com/Brxdy22/Dispatcharr-Clean-Titles-Plugin). Without it the lists still work.
 - Run the tests with `python3 -m unittest test_plugin`.
+
+## More by Brxdy22
+
+- [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover): Proxy that gives an M3U account several provider URLs and fails over between them. Docker image: [brxdy22/m3u-failover](https://hub.docker.com/r/brxdy22/m3u-failover).
+- [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin): Retries a failed VOD stream on the next provider account that carries the title.
+- [Clean Titles](https://github.com/Brxdy22/Dispatcharr-Clean-Titles-Plugin): Renames VOD movies and series to their official TMDB titles and tidies provider categories.
+- [Teamarr Assistant](https://github.com/Brxdy22/Dispatcharr-Teamarr-Assistant-Plugin): Tags regional sports networks with their teams and starts Teamarr generations when new streams appear.
 
 ## Release notes
 
