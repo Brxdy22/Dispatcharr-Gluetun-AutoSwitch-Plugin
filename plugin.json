@@ -1,7 +1,7 @@
 {
   "name": "Gluetun AutoSwitch",
   "version": "1.8.4.2",
-  "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums. Exits a provider refused are kept off for 30 days.",
+  "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, a scheduled speed test falls below your minimums, or a new exit fails the quick test that follows every switch. Exits a provider refused are kept off for 30 days.",
   "author": "Brxdy22",
   "license": "MIT",
   "repo_url": "https://github.com/Brxdy22/Dispatcharr-Gluetun-AutoSwitch-Plugin",
