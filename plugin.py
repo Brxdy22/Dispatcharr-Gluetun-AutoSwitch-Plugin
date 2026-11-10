@@ -17,7 +17,7 @@ proxies count as the provider, because every account here sits behind one. These
 wait for viewers to leave, and for VOD_END_GRACE_SECONDS after a VOD was last open;
 slow streams and VOD rejections do not, as someone is already affected.
 
-Rejections come from the attempts VOD Failover already logs, so no extra logins
+Rejections come from the attempts Failover Manager already logs, so no extra logins
 reach the provider. Only answers a new address can fix count: a 404 (title missing)
 or 458 (connection limit) says nothing about the exit.
 
@@ -167,7 +167,7 @@ ATTEMPT = re.compile(
 )
 Account = namedtuple("Account", "name server_url username password user_agent")
 REJECTION_LINE = re.compile(
-    r"\[VOD-Failover\] Marked \w+ on account (?P<account>.+?) as bad for \d+s "
+    r"\[(?:Failover-Manager|VOD-Failover)\] Marked \w+ on account (?P<account>.+?) as bad for \d+s "
     r"\(\w+\): Streaming error: (?P<code>\d{3}) "
 )
 # m3u-failover asks here when every server of an account refuses VOD on this exit.
@@ -2257,7 +2257,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.8.4.1"
+    version = "1.8.4.2"
     description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
 
     @property

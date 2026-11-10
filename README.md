@@ -8,7 +8,7 @@ Moves [Gluetun](https://github.com/qdm12/gluetun) to another VPN exit when a str
 
 Tested on Dispatcharr 0.33.0.
 
-Works with [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover) and [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin). All three together cover provider URL failover, account failover for VOD, and VPN exit switching.
+Works with [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover) and [Failover Manager](https://github.com/Brxdy22/Dispatcharr-Failover-Manager-Plugin). All three together cover provider URL failover, account failover for VOD, and VPN exit switching.
 
 See [Dispatcharr Failover Stack](https://github.com/Brxdy22/Dispatcharr-Failover-Stack) to install all three side by side.
 
@@ -16,7 +16,7 @@ See [Dispatcharr Failover Stack](https://github.com/Brxdy22/Dispatcharr-Failover
 
 Copy this repository's files into `/data/plugins/gluetun_autoswitch` in your Dispatcharr data folder, then enable **Gluetun AutoSwitch** on the Plugins page.
 
-Or download `gluetun_autoswitch-1.8.4.1.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
+Or download `gluetun_autoswitch-1.8.4.2.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
 
 ## Use
 
@@ -47,7 +47,7 @@ Keep this key private: `GET /v1/vpn/settings` returns your VPN private key. For 
 ## Notes
 
 - Exit checks and the relay list use Mullvad's public endpoints, so it is built for Mullvad.
-- VOD rejection detection reads the attempts logged by [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin).
+- VOD rejection detection reads the attempts logged by [Failover Manager](https://github.com/Brxdy22/Dispatcharr-Failover-Manager-Plugin).
 - After a switch it asks [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover) 1.1.0 or later to close dead live connections, so streams reconnect sooner. Without it, streams wait for Dispatcharr's read timeout.
 - Switching at the first refused VOD and the background VOD check need [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover) 1.2 or later in front of the account. It finds the refusal and asks this plugin to move, on `127.0.0.1:9733`.
 - Closing streams just before a switch needs [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover) 1.2.1 or later. Update it first, because older versions pass that request on to your provider.
@@ -57,7 +57,7 @@ Keep this key private: `GET /v1/vpn/settings` returns your VPN private key. For 
 ## More by Brxdy22
 
 - [M3U Failover](https://github.com/Brxdy22/Dispatcharr-M3U-Failover): Proxy that gives an M3U account several provider URLs and fails over between them. Docker image: [brxdy22/m3u-failover](https://hub.docker.com/r/brxdy22/m3u-failover).
-- [VOD Failover](https://github.com/Brxdy22/Dispatcharr-VOD-Failover-Plugin): Retries a failed VOD stream on the next provider account that carries the title.
+- [Failover Manager](https://github.com/Brxdy22/Dispatcharr-Failover-Manager-Plugin): Retries a failed VOD stream on the next provider account that carries the title.
 - [Clean Titles](https://github.com/Brxdy22/Dispatcharr-Clean-Titles-Plugin): Renames VOD movies and series to their official TMDB titles and tidies provider categories.
 - [Teamarr Assistant](https://github.com/Brxdy22/Dispatcharr-Teamarr-Assistant-Plugin): Tags regional sports networks with their teams and starts Teamarr generations when new streams appear.
 

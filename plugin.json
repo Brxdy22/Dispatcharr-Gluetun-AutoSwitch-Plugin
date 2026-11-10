@@ -1,6 +1,6 @@
 {
   "name": "Gluetun AutoSwitch",
-  "version": "1.8.4.1",
+  "version": "1.8.4.2",
   "description": "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, or a scheduled speed test falls below your minimums. Exits a provider refused are kept off for 30 days.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -138,7 +138,7 @@
       "label": "VOD rejections before switching",
       "type": "number",
       "default": 3,
-      "help_text": "How many VOD attempts one account may have refused on the current exit before moving. Needs the VOD Failover plugin, which logs each attempt."
+      "help_text": "How many VOD attempts one account may have refused on the current exit before moving. Needs the Failover Manager plugin (formerly VOD Failover), which logs each attempt."
     },
     {
       "id": "reject_window_minutes",

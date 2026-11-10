@@ -309,7 +309,7 @@ class Limits(unittest.TestCase):
     def test_old_switches_age_out(self):
         self.assertEqual(held_back([1000, 2000, 3000], 10000, 300, 3), "")
 
-LOG = ("2026-11-04 18:16:31,528 -0600 INFO _dispatcharr_plugin_vod_failover.plugin [VOD-Failover] "
+LOG = ("2026-11-04 18:16:31,528 -0600 INFO _dispatcharr_plugin_failover_manager.plugin [Failover-Manager] "
        "Marked {} on account {} as bad for 300s (episode): Streaming error: {}")
 CODES = parse_codes(DEFAULTS["reject_codes"])
 
@@ -329,7 +329,11 @@ class Rejections(unittest.TestCase):
                       "429 Client Error", "511 Server Error", "503 Server Error: Service Unavailable",
                       "HTTPConnectionPool(host='127.0.0.1', port=8092): Read timed out."):
             self.assertIsNone(parse_rejection(self.line(error), CODES), error)
+    def test_old_plugin_name_still_counts(self):
+        old = self.line("403 Client Error: Forbidden for url").replace("[Failover-Manager]", "[VOD-Failover]")
+        self.assertEqual(parse_rejection(old, CODES), ("ProviderB", 403))
     def test_unrelated_lines(self):
+        self.assertIsNone(parse_rejection("[Failover-Manager] EN - Show: playing from account ProviderB", CODES))
         self.assertIsNone(parse_rejection("[VOD-Failover] EN - Show: playing from account ProviderB", CODES))
         self.assertIsNone(parse_rejection("ERROR vod_proxy 403 Client Error: Forbidden", CODES))
     def test_counts_per_account_inside_the_window(self):
