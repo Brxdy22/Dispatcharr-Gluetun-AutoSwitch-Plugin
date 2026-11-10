@@ -2258,7 +2258,7 @@ def watch_requests():
 class Plugin:
     name = "Gluetun AutoSwitch"
     version = "1.8.4.2"
-    description = "Moves Gluetun to another VPN exit when streams stay too slow or a provider refuses the exit."
+    description = "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, a scheduled speed test falls below your minimums, or a new exit fails the quick test that follows every switch. Exits a provider refused are kept off for 30 days."
 
     @property
     def fields(self):
