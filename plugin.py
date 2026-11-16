@@ -144,6 +144,8 @@ EXIT_CHECK_DOWN_SECONDS = 5  # short, because it runs while people may be watchi
 SEVERE_SHARE = 0.25  # a scheduled test under this share of the usual fails at once
 SLOW_BLOCK_HOURS = 6  # an exit proven slow is skipped this long, not 30 days: slowness passes
 SLOW_BLOCK_ACCOUNT = "slow speed"
+SPEED_EVIDENCE_SECONDS = 3 * HOUR  # a speed test this old still speaks for the exit it ran on
+VOD_PING_SECONDS = 120  # a provider ping taken for a slow VOD is reused this long
 FAIL_SPEED = 0.6  # with playback_only, a stream must fall under this to count as failing
 DROP_AFTER_SECONDS = 5  # time for the tunnel to come back before streams reconnect
 LOG_PATH = "/data/logs/dispatcharr.log"
@@ -866,6 +868,16 @@ def exit_suspects(readings, minimum):
     return [r for r in measured if r["speed"] < minimum and r["kind"] not in healthy]
 
 
+def exit_wide_problems(result, accounts):
+    """Speed test problems that blame the exit for these accounts' streams: download,
+    upload or ping, or one of these providers' pings. Another provider's ping is not."""
+    names = tuple(f"{name} ping " for name in accounts if name)
+    return [
+        problem for problem in (result.get("problems") or [])
+        if str(problem).startswith(("download ", "upload ", "ping ") + names)
+    ]
+
+
 def local_stamp():
     try:
         from datetime import datetime
@@ -1267,6 +1279,11 @@ class Store:
                 continue
         return found
 
+    def speed_result(self):
+        """(when, result) of the last speed test."""
+        data = self._read_json(self.speed_path)
+        return float(data.get("at") or 0), data.get("result") or {}
+
     def set_speed(self, value):
         self._write_json(self.speed_path, value)
 
@@ -1401,6 +1418,9 @@ class Service:
         self.move_seen = max(self.store.switches(), default=0.0)
         self.check_at = None
         self.feeds_noted = set()
+        self.vod_ignored = set()
+        self.vod_accounts = {}  # m3u profile id -> account name
+        self.vod_pings = {}  # account name -> (when, ping trouble or "")
         self.switch_lock = threading.Lock()  # the monitor and m3u-failover's requests take turns
         self.exit_seen, self.exit_seen_at = {}, 0.0
         self.moved_at = 0.0
@@ -1686,7 +1706,7 @@ class Service:
         self.check_tunnel(settings, now)
         self.sync_speed(settings)
         self.notice_moves(now)
-        slow = self.slow_streams(readings, minimum, now, sustain)
+        slow = self.exit_wide(self.slow_streams(readings, minimum, now, sustain), now, settings)
         self.slow_now = [(r["name"], r["speed"]) for r in slow]
         urgent = [self.slow_cause(r) for r in slow]
         if self.worse_now and settings["auto_switch"]:
@@ -1763,6 +1783,68 @@ class Service:
                            detail="not moving: the exit does not look like the cause")
         self.feeds_noted = set(feeds)
         return chosen
+
+    def exit_wide(self, slow, now, settings):
+        """Slow streams left once slow VOD with no proof against the exit is dropped. A
+        provider throttles one file or one account while the exit is fine (seen at 0.33x
+        with 217 Mbps to the same provider), and a move then costs the slot for ~5 min.
+        Proof: a slow live stream too, slow VOD from two providers, a recent speed test of
+        this exit with problems, or a fresh ping to the provider far over its usual. A
+        stream clearly worse since the last move already blames the new exit."""
+        vods = [r for r in slow if r["kind"] == "vod" and r["name"] not in self.worse_now]
+        if not vods:
+            self.vod_ignored = set()
+            return slow
+        if any(r["kind"] == "live" for r in slow):
+            return slow
+        accounts = {r["name"]: self.vod_account(r.get("profile")) for r in vods}
+        if len({name for name in accounts.values() if name}) >= 2 or self.exit_trouble(set(accounts.values()), now, settings):
+            return slow
+        for r in vods:
+            if r["name"] not in self.vod_ignored:
+                self.store.log("vod_slow_ignored", stream=r["name"], provider=accounts[r["name"]],
+                               ratio=round(r["speed"], 2),
+                               detail="not moving: no sign the exit is the cause, the provider is throttling")
+        self.vod_ignored = {r["name"] for r in vods}
+        return [r for r in slow if r not in vods]
+
+    def vod_account(self, profile):
+        """Account name of a VOD's m3u profile, or None. Looked up once per profile."""
+        if not profile:
+            return None
+        if profile not in self.vod_accounts:
+            try:
+                from apps.m3u.models import M3UAccountProfile
+                found = M3UAccountProfile.objects.filter(id=profile).select_related("m3u_account").first()
+                self.vod_accounts[profile] = found.m3u_account.name if found else None
+            except Exception:
+                return None
+        return self.vod_accounts[profile]
+
+    def exit_trouble(self, accounts, now, settings):
+        """Why the current exit looks bad for these accounts, or []. The last speed test
+        counts when it ran on this exit lately; without one, a quick ping to the provider."""
+        here = self.current_exit(now)
+        at, result = self.store.speed_result()
+        if here.get("ip") and result.get("ip") == here.get("ip") and now - at < SPEED_EVIDENCE_SECONDS:
+            return exit_wide_problems(result, accounts)
+        return [trouble for name in sorted(n for n in accounts if n) if (trouble := self.ping_trouble(name, now, settings))]
+
+    def ping_trouble(self, name, now, settings):
+        """'<account> ping N ms (usually M)' when a fresh ping is far over its usual, else ''.
+        A handshake only, no slot; cached so a slow stream doesn't ping every tick."""
+        cached = self.vod_pings.get(name)
+        if cached and now - cached[0] < VOD_PING_SECONDS:
+            return cached[1]
+        trouble, factor = "", float(settings["provider_ping_factor"])
+        account = next((a for a in self.current_accounts(now) if a.name == name), None)
+        if factor > 0 and account is not None:
+            pings, hosts = provider_pings([account])
+            value, usual = pings.get(name), usual_pings(self.store.entries(), hosts).get(name)
+            if value is not None and usual and value > usual * factor:
+                trouble = f"{name} ping {value:.0f} ms (usually {usual:.0f})"
+        self.vod_pings[name] = (now, trouble)
+        return trouble
 
     def worse_after_move(self, reading, now):
         moved = self.moved_for.get(reading["name"])
@@ -1956,6 +2038,7 @@ class Service:
                 "name": state.get("content_name") or session,
                 "speed": tracker.speed(required, window),
                 "length": self.length_source.get(session),
+                "profile": state.get("m3u_profile_id"),
             })
         for session in set(self.vod) - seen:
             del self.vod[session]
@@ -2257,7 +2340,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.8.4.2"
+    version = "1.8.4.3"
     description = "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, a scheduled speed test falls below your minimums, or a new exit fails the quick test that follows every switch. Exits a provider refused are kept off for 30 days."
 
     @property

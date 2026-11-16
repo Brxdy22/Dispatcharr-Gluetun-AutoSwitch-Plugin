@@ -1868,5 +1868,117 @@ class VodEndGrace(unittest.TestCase):
         self.assertEqual(P.route(["title at 0.50x"], [], watching)[0], "act")
 
 
+class SlowVodIsTheProvider(unittest.TestCase):
+    HERE = {"ip": "1.2.3.4", "city": "Seattle"}
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.s = P.Service({"data_dir": self.dir.name, "settings": {}})
+        self.s.exit_seen, self.s.exit_seen_at = dict(self.HERE), 1e12
+        self.s.vod_accounts = {"7": "ProviderC", "8": "ProviderB"}
+        self.s.accounts, self.s.accounts_at = [], 1e12
+        self.vod = {"kind": "vod", "name": "Movie Title", "speed": 0.33, "profile": "7"}
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def speed(self, problems, ip="1.2.3.4", at=1e12 - 60):
+        self.s.store.set_speed({"at": at, "result": {"ip": ip, "problems": problems}})
+
+    def ignored(self):
+        return [e for e in self.s.store.entries() if e.get("event") == "vod_slow_ignored"]
+
+    def test_healthy_test_on_this_exit_ignores_slow_vod(self):
+        self.speed([])
+        self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [])
+        self.s.exit_wide([self.vod], 1e12 + 10, DEFAULTS)
+        events = self.ignored()
+        self.assertEqual(len(events), 1)  # once, not every tick
+        self.assertEqual((events[0]["provider"], events[0]["ratio"]), ("ProviderC", 0.33))
+
+    def test_no_test_and_normal_ping_ignores(self):
+        self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [])
+        self.assertEqual(len(self.ignored()), 1)
+
+    def test_bad_download_on_this_exit_moves(self):
+        self.speed(["download 20 Mbps (minimum 100)"])
+        self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [self.vod])
+
+    def test_this_providers_ping_moves(self):
+        self.speed(["ProviderC ping 400 ms (usually 30)"])
+        self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [self.vod])
+
+    def test_another_providers_ping_is_no_proof(self):
+        self.speed(["ProviderB ping 400 ms (usually 30)"])
+        self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [])
+
+    def test_test_from_another_exit_is_no_proof(self):
+        self.speed(["download 20 Mbps (minimum 100)"], ip="9.9.9.9")
+        self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [])
+
+    def test_old_test_is_no_proof(self):
+        self.speed(["download 20 Mbps (minimum 100)"], at=1e12 - P.SPEED_EVIDENCE_SECONDS)
+        self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [])
+
+    def test_slow_live_too_moves(self):
+        live = {"kind": "live", "name": "channel 1", "speed": 0.2}
+        self.speed([])
+        self.assertEqual(self.s.exit_wide([self.vod, live], 1e12, DEFAULTS), [self.vod, live])
+
+    def test_two_providers_slow_moves(self):
+        other = {"kind": "vod", "name": "Film", "speed": 0.3, "profile": "8"}
+        self.speed([])
+        self.assertEqual(len(self.s.exit_wide([self.vod, other], 1e12, DEFAULTS)), 2)
+
+    def test_two_from_one_provider_is_still_the_provider(self):
+        other = {"kind": "vod", "name": "Film", "speed": 0.3, "profile": "7"}
+        self.speed([])
+        self.assertEqual(self.s.exit_wide([self.vod, other], 1e12, DEFAULTS), [])
+
+    def test_worse_after_a_move_still_blames_the_exit(self):
+        self.speed([])
+        self.s.worse_now = ["Movie Title"]
+        self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [self.vod])
+
+    def test_slow_live_alone_untouched(self):
+        live = [{"kind": "live", "name": "channel 1", "speed": 0.2}]
+        self.assertEqual(self.s.exit_wide(live, 1e12, DEFAULTS), live)
+
+    def test_fresh_ping_far_over_usual_moves(self):
+        class Account:
+            name, server_url = "ProviderC", "http://provider.example:80"
+        saved_pings, saved_usual = P.provider_pings, P.usual_pings
+        calls = []
+        P.provider_pings = lambda accounts: calls.append(1) or ({"ProviderC": 500.0}, {"ProviderC": "h:80"})
+        P.usual_pings = lambda entries, hosts=None: {"ProviderC": 30.0}
+        try:
+            self.s.accounts = [Account()]
+            self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [self.vod])
+            self.s.exit_wide([self.vod], 1e12 + 10, DEFAULTS)
+        finally:
+            P.provider_pings, P.usual_pings = saved_pings, saved_usual
+        self.assertEqual(calls, [1])  # cached: one ping, not one per tick
+
+    def test_fresh_ping_near_usual_ignores(self):
+        class Account:
+            name, server_url = "ProviderC", "http://provider.example:80"
+        saved_pings, saved_usual = P.provider_pings, P.usual_pings
+        P.provider_pings = lambda accounts: ({"ProviderC": 35.0}, {"ProviderC": "h:80"})
+        P.usual_pings = lambda entries, hosts=None: {"ProviderC": 30.0}
+        try:
+            self.s.accounts = [Account()]
+            self.assertEqual(self.s.exit_wide([self.vod], 1e12, DEFAULTS), [])
+        finally:
+            P.provider_pings, P.usual_pings = saved_pings, saved_usual
+
+    def test_unknown_profile_needs_exit_wide_proof(self):
+        vod = {**self.vod, "profile": None}
+        self.speed([])
+        self.assertEqual(self.s.exit_wide([vod], 1e12, DEFAULTS), [])
+        self.speed(["ping 300 ms (limit 150)"])
+        self.s.vod_ignored = set()
+        self.assertEqual(self.s.exit_wide([vod], 1e12, DEFAULTS), [vod])
+
+
 if __name__ == "__main__":
     unittest.main()

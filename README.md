@@ -16,7 +16,7 @@ See [Dispatcharr Failover Stack](https://github.com/Brxdy22/Dispatcharr-Failover
 
 Copy this repository's files into `/data/plugins/gluetun_autoswitch` in your Dispatcharr data folder, then enable **Gluetun AutoSwitch** on the Plugins page.
 
-Or download `gluetun_autoswitch-1.8.4.2.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
+Or download `gluetun_autoswitch-1.8.4.3.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
 
 ## Use
 
