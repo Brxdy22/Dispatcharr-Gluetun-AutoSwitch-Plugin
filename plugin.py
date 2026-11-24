@@ -146,6 +146,7 @@ SLOW_BLOCK_HOURS = 6  # an exit proven slow is skipped this long, not 30 days: s
 SLOW_BLOCK_ACCOUNT = "slow speed"
 SPEED_EVIDENCE_SECONDS = 3 * HOUR  # a speed test this old still speaks for the exit it ran on
 VOD_PING_SECONDS = 120  # a provider ping taken for a slow VOD is reused this long
+VOD_SLOW_MEMORY_SECONDS = 30 * 60  # a provider slow on an exit still counts against it this long
 FAIL_SPEED = 0.6  # with playback_only, a stream must fall under this to count as failing
 DROP_AFTER_SECONDS = 5  # time for the tunnel to come back before streams reconnect
 LOG_PATH = "/data/logs/dispatcharr.log"
@@ -1421,6 +1422,7 @@ class Service:
         self.vod_ignored = set()
         self.vod_accounts = {}  # m3u profile id -> account name
         self.vod_pings = {}  # account name -> (when, ping trouble or "")
+        self.vod_slow_seen = {}  # exit ip -> {account name: last seen slow}
         self.switch_lock = threading.Lock()  # the monitor and m3u-failover's requests take turns
         self.exit_seen, self.exit_seen_at = {}, 0.0
         self.moved_at = 0.0
@@ -1798,7 +1800,7 @@ class Service:
         if any(r["kind"] == "live" for r in slow):
             return slow
         accounts = {r["name"]: self.vod_account(r.get("profile")) for r in vods}
-        if len({name for name in accounts.values() if name}) >= 2 or self.exit_trouble(set(accounts.values()), now, settings):
+        if len(self.slow_providers(accounts.values(), now)) >= 2 or self.exit_trouble(set(accounts.values()), now, settings):
             return slow
         for r in vods:
             if r["name"] not in self.vod_ignored:
@@ -1807,6 +1809,23 @@ class Service:
                                detail="not moving: no sign the exit is the cause, the provider is throttling")
         self.vod_ignored = {r["name"] for r in vods}
         return [r for r in slow if r not in vods]
+
+    def slow_providers(self, names, now):
+        """Providers slow on this exit now or in the last 30 min. A viewer trying one
+        provider, then another, never has both slow in the same tick."""
+        names = {n for n in names if n}
+        ip = self.current_exit(now).get("ip")
+        if not ip:
+            return names
+        cutoff = now - VOD_SLOW_MEMORY_SECONDS
+        self.vod_slow_seen = {
+            e: kept for e, seen in self.vod_slow_seen.items()
+            if (kept := {n: at for n, at in seen.items() if at > cutoff})
+        }
+        seen = self.vod_slow_seen.setdefault(ip, {})
+        for name in names:
+            seen[name] = now
+        return set(seen)
 
     def vod_account(self, profile):
         """Account name of a VOD's m3u profile, or None. Looked up once per profile."""
@@ -2340,7 +2359,7 @@ def watch_requests():
 
 class Plugin:
     name = "Gluetun AutoSwitch"
-    version = "1.8.4.3"
+    version = "1.8.4.4"
     description = "Moves Gluetun to another VPN exit when a stream stays too slow, a provider keeps rejecting VOD or refuses it on this exit, a login is refused, a live source shows Cloudflare's block page, a scheduled speed test falls below your minimums, or a new exit fails the quick test that follows every switch. Exits a provider refused are kept off for 30 days."
 
     @property

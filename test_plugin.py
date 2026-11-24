@@ -1930,6 +1930,36 @@ class SlowVodIsTheProvider(unittest.TestCase):
         self.speed([])
         self.assertEqual(len(self.s.exit_wide([self.vod, other], 1e12, DEFAULTS)), 2)
 
+    def at(self, now, slow):
+        self.s.exit_seen_at = now  # the exit as read this tick
+        return self.s.exit_wide(slow, now, DEFAULTS)
+
+    def test_providers_slow_in_turn_on_one_exit_move(self):
+        other = {"kind": "vod", "name": "Film", "speed": 0.05, "profile": "8"}
+        self.speed([])
+        results = [self.at(1e12 + m * 60, [r]) for r, m in ((self.vod, 0), (other, 13), (self.vod, 26), (other, 40))]
+        self.assertEqual(results, [[], [other], [self.vod], [other]])
+
+    def test_one_provider_slow_again_and_again_is_still_ignored(self):
+        self.speed([])
+        for m in (0, 13, 26, 40):
+            self.assertEqual(self.at(1e12 + m * 60, [self.vod]), [])
+
+    def test_slow_provider_forgotten_after_30_min(self):
+        other = {"kind": "vod", "name": "Film", "speed": 0.05, "profile": "8"}
+        self.speed([], at=1e12 + 1800)
+        self.s.exit_wide([self.vod], 1e12, DEFAULTS)
+        self.s.exit_seen_at = 1e12 + 1801
+        self.assertEqual(self.s.exit_wide([other], 1e12 + 1801, DEFAULTS), [])
+        self.assertNotIn("ProviderC", self.s.vod_slow_seen["1.2.3.4"])
+
+    def test_slow_provider_on_another_exit_is_no_proof(self):
+        other = {"kind": "vod", "name": "Film", "speed": 0.05, "profile": "8"}
+        self.speed([], ip="5.6.7.8")
+        self.s.exit_wide([self.vod], 1e12, DEFAULTS)
+        self.s.exit_seen = {"ip": "5.6.7.8", "city": "Denver"}
+        self.assertEqual(self.s.exit_wide([other], 1e12 + 60, DEFAULTS), [])
+
     def test_two_from_one_provider_is_still_the_provider(self):
         other = {"kind": "vod", "name": "Film", "speed": 0.3, "profile": "7"}
         self.speed([])
